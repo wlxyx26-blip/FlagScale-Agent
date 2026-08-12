@@ -1,108 +1,9 @@
 ---
-name: train-config
-description: Generate and manage FlagScale training configuration files. Covers the two-level Hydra YAML structure (experiment
-  config + task config), parallelism strategy (TP/PP/DP/EP/CP/VPP), mixed precision (BF16/FP16/FP8), TransformerEngine integration,
+description: Generate and manage FlagScale training configuration files. Covers the
+  two-level Hydra YAML structure (experiment config + task config), parallelism strategy
+  (TP/PP/DP/EP/CP/VPP), mixed precision (BF16/FP16/FP8), TransformerEngine integration,
   checkpoint resume, multi-node setup, and topology-aware defaults.
-keywords:
-- config
-- configuration
-- yaml
-- parallel
-- parallelism
-- TP
-- PP
-- DP
-- tensor parallel
-- pipeline parallel
-- mixed precision
-- bf16
-- fp8
-- transformer engine
-- hostfile
-- multi-node
-- 配置
-- 并行
-- 并行策略
-- 训练配置
-parameters:
-- name: model_name
-  description: Model name for config directory (e.g., qwen3, llama3)
-- name: model_size
-  description: Model size variant (e.g., 0_6b, 7b, 70b)
-requires:
-- workspace-layout
-suggests:
-- topo-detect
-constraints:
-- id: train_config_gbs_too_large_for_smoke_test
-  description: Global batch size must be minimal for smoke tests and initial validation runs. GBS > DP*mbs*8 is wasteful.
-  trigger:
-    tools:
-    - edit_file
-    - write_file
-    keywords:
-    - global_batch_size
-  prompt: "For smoke test / environment validation / initial '跑通' runs, global_batch_size should equal
-    DP * micro_batch_size (or at most 8x that). If train_iters <= 50 or train_samples is small or this is
-    clearly an initial validation (not full pretraining), check if GBS is far larger than DP*mbs.
-    With DP=4 mbs=1, GBS should be 4 (not 2048). The GBS=2048 in getting-started.md examples is for
-    real pretraining — never copy it for validation runs."
-  correction: "GBS too large for smoke test — reduce to DP × micro_batch_size (e.g., GBS=4 for DP=4 mbs=1).
-    Also set train_iters=20 and REMOVE train_samples entirely for smoke tests."
-- id: train_config_train_samples_too_large_for_smoke_test
-  description: train_samples should not be set for smoke tests. Use train_iters instead.
-  trigger:
-    tools:
-    - edit_file
-    - write_file
-    keywords:
-    - train_samples
-  prompt: "If this is a smoke test / environment validation / initial '跑通' run (train_iters <= 50, or
-    the user said '跑通'/'验证'/'test'), train_samples should NOT be set. Use train_iters=20 instead.
-    train_samples=244141056 (from getting-started.md) means the model will train for thousands of iterations
-    which defeats the purpose of a quick validation. Check: is train_samples being set alongside a small
-    train_iters? If train_iters is not set at all and train_samples is very large (>10000), this is likely
-    a smoke test that forgot to limit iterations."
-  correction: "Remove train_samples for smoke tests. Use train_iters=20 (or at most 50) instead.
-    train_samples controls total training duration — for validation, you only need 10-20 iterations."
-- id: train_config_exp_dir_not_shared_storage
-  description: exp_dir must use shared storage path (not ./outputs/) when shared storage is available
-  trigger:
-    tools:
-    - edit_file
-    - write_file
-    keywords:
-    - exp_dir
-    - output_dir
-    - ./outputs
-  prompt: If shared_storage is available and exp_dir starts with './outputs/' or './' (local path), flag it. exp_dir should
-    use the workspace_root from workspace-layout.
-  correction: exp_dir should use shared storage path, not ./outputs/
-- id: smoke_test_reminder
-  description: Remind to run a smoke test before full training
-  trigger:
-    tools:
-    - write_file
-    - edit_file
-    keywords:
-    - train_iters
-    - global_batch_size
-    - num_layers
-  prompt: Check if this is a new config that hasn't been smoke-tested yet
-  correction: Run a smoke test (train_iters=20) before launching full training.
-context_injection:
-  always:
-  - Common Configuration Pitfalls
-  - Config Validation Before Launch
-  by_tool:
-    write_file:
-    - Two-Level YAML Structure
-    - Config Generation Template
-    edit_file:
-    - Config Verification Checklist
-    - Parallelism Strategy
-    shell:
-    - Quick Test vs Real Training
+name: train-config
 ---
 
 <!--
@@ -216,7 +117,7 @@ find . -name "__pycache__" -path "*/conf/*" -exec rm -rf {} +
 
 1. `data_path` with suffix: `data_path: ./data/file.bin` is WRONG. Use `data_path: ./data/file` (no suffix)
 2. `before_start` conda: if `cmds.before_start` activates a different env than your current shell, training runs in that env — verify it has all dependencies
-3. `global_batch_size` not divisible: must be divisible by `DP × micro_batch_size`. DP = total_GPUs / (TP × PP × CP × EP)
+3. `global_batch_size` not divisible: must be divisible by `DP × micro_batch_size`. DP = total_GPUs / (TP × PP × CP)
 4. `transformer_impl` mismatch: if `transformer_impl: transformer_engine` but TransformerEngine-FL is not installed, training crashes immediately. Fall back to `transformer_impl: local`
 5. `hostfile` null vs missing: for single-node, explicitly set `hostfile: null`. Omitting it may cause Hydra to use a default
 6. Modifying the wrong YAML: changes to `train.yaml` don't affect model/data params — those are in `train/<size>.yaml`
@@ -235,14 +136,14 @@ ls ${data_path}.bin ${data_path}.idx
 ls ${checkpoint_load_path}/
 
 # 3. GPU count matches parallelism
-# total_GPUs = TP * PP * DP * EP (DP is implicit)
+# DP = total_GPUs / (TP * PP * CP)  — EP does NOT reduce DP
 # nproc_per_node * nnodes must equal total_GPUs
 
 # 4. global_batch_size divisibility
 python3 -c "
-tp, pp, ep, cp = TP, PP, EP, CP
+tp, pp, cp = TP, PP, CP
 total_gpus = NPROC * NNODES
-dp = total_gpus // (tp * pp * ep * cp)
+dp = total_gpus // (tp * pp * cp)
 gbs = GLOBAL_BATCH_SIZE
 mbs = MICRO_BATCH_SIZE
 assert gbs % (dp * mbs) == 0, f'GBS {gbs} not divisible by DP*MBS={dp*mbs}'
@@ -262,7 +163,7 @@ Do NOT skip this check. Config errors waste GPU hours.
 |-----------|----------|---------------|
 | TP (Tensor Parallel) | `system.tensor_model_parallel_size` | Splits weight matrices across GPUs within a node |
 | PP (Pipeline Parallel) | `system.pipeline_model_parallel_size` | Splits layers across GPU groups |
-| DP (Data Parallel) | Implicit: total_GPUs / (TP × PP × CP × EP) | Replicates model, splits data |
+| DP (Data Parallel) | Implicit: total_GPUs / (TP × PP × CP) | Replicates model, splits data |
 | EP (Expert Parallel) | `system.expert_model_parallel_size` | Splits MoE experts across GPUs |
 | CP (Context Parallel) | `system.context_parallel_size` | Splits sequence length across GPUs |
 | VPP (Virtual Pipeline) | `system.num_layers_per_virtual_pipeline_stage` | Reduces PP bubble when PP ≥ 4 |
@@ -291,11 +192,13 @@ Don't hardcode parallelism choices based on generic rules. The optimal strategy 
 
 ```
 total_GPUs = nnodes × nproc_per_node
-TP × PP × CP × EP must divide total_GPUs evenly
-DP = total_GPUs / (TP × PP × CP × EP)
+TP × PP × CP must divide total_GPUs evenly
+DP = total_GPUs / (TP × PP × CP)
+Expert_DP = total_GPUs / (expert_TP × EP × PP)  # expert_TP defaults to TP
 global_batch_size must be divisible by (DP × micro_batch_size)
 num_layers must be divisible by PP
 If VPP: num_layers / PP must be divisible by num_layers_per_virtual_pipeline_stage
+Note: EP does NOT reduce Dense DP. EP operates within the DP group.
 ```
 
 ### Topology-Aware Defaults
