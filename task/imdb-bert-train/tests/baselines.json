@@ -1,0 +1,12 @@
+
+{
+  "resouce":"FlagScale-Agent-main/jobs/Agent_update_bert_情感分析_4_nosolution",
+  "model_family": "bert-base-uncased",
+  "baseline_accuracy":0.92112,
+  "baseline_f1": 0.92152,
+  "baseline_roc_auc": 0.97524,
+  "minimum_accuracy": 0.9,
+  "minimum_f1": 0.9,
+  "calibration_status": "provisional",
+  "calibration_note": "Replace with median of at least three controlled Oracle/reference runs on the same host."
+}

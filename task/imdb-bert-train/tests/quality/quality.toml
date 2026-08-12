@@ -1,0 +1,70 @@
+[judge]
+judge = "openai/gpt-5.6-sol"
+atif-trajectory = "/logs/agent/trajectory.json"
+
+files = [
+
+  "/app/submission/run_manifest.json",
+  "/app/submission/metrics.json",
+  "/app/submission/runtime.json",
+  "/app/submission/training.log",
+]
+
+mode = "individual"
+timeout = 900
+
+
+[[criterion]]
+id = "process_quality"
+type = "numeric"
+min = 0
+max = 100
+weight = 0.8
+
+description = """
+你是智能体执行过程评测专家。
+
+请根据提供的ATIF轨迹及提供的任务结果文件，对执行过程质量评分，范围为0至100。
+
+重点评价：
+1. 执行过程中工具选择是否适合当前任务；
+2. 工具调用传入参数，以及每个工具调用后有对应的观察结果；
+3. 环境检查、数据检查、代码编写、训练、评估、模型保存和最终验证的顺序是否合理；
+4. 是否存在明显无关、重复或没有产生新信息的操作；
+5. 是否根据工具返回结果调整后续行动；
+
+不得根据最终任务是否成功直接给高分。
+不得推测模型隐藏思维，只依据所给提供可观察轨迹进行评分。
+"""
+
+
+[[criterion]]
+id = "robustness_quality"
+type = "numeric"
+min = 0
+max = 100
+weight = 0.2
+
+description = """
+你是智能体稳定性和错误恢复评测专家。
+
+请根据提供的ATIF轨迹及提供的任务结果文件评分，范围为0至100。
+
+重点评价：
+1. 是否可以识别工具、命令、环境、训练或文件异常；
+2. 出现异常或阻断后，是否理解失败原，并且能否针对问题改变命令、参数、代码或执行方案；
+3. 修复后是否重新验证；
+4. 是否存在重复触发相同错误或未解决异常；
+5. 多轮被被阻断后，最终执行状态是否稳定；
+6.文件或者其余不存在，有没有重新确认路径
+
+评分约定：
+- 若没有观察到实质性错误、阻断、拒绝或未解决异常，且过程稳定完成，评分为100；
+- 出现异常但被准确诊断、有效修复并重新验证，可获得高分；
+- 重复失败、忽略错误、错误后没有验证，应明显扣分；
+- 不得因为最终任务成功而自动判定恢复过程优秀。
+"""
+
+
+[scoring]
+aggregation = "weighted_mean"
