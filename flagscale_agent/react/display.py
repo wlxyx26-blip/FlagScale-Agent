@@ -152,20 +152,29 @@ def _visible_width(text):
 
 
 def _truncate_to_width(text, max_width):
-    """Truncate text so display width fits within max_width."""
+    """Truncate text so display width fits within max_width, preserving ANSI codes."""
     if _visible_width(text) <= max_width:
         return text
-    plain = re.sub(r"\033\[[0-9;]*m", "", text)
+    # Walk through text keeping ANSI sequences intact
     width = 0
-    cut = 0
-    for i, c in enumerate(plain):
-        cw = _char_width(c)
+    result = []
+    i = 0
+    while i < len(text):
+        # Skip ANSI escape sequences (don't count toward width)
+        if text[i] == '\033' and i + 1 < len(text) and text[i + 1] == '[':
+            j = i + 2
+            while j < len(text) and text[j] not in 'mGHJK':
+                j += 1
+            result.append(text[i:j + 1])
+            i = j + 1
+            continue
+        cw = _char_width(text[i])
         if width + cw > max_width - 3:
-            cut = i
             break
+        result.append(text[i])
         width += cw
-        cut = i + 1
-    return plain[:cut] + "..." + "\033[0m"
+        i += 1
+    return ''.join(result) + "...\033[0m"
 
 
 def _fmt_tokens(n):
@@ -192,7 +201,10 @@ _TOOL_ICONS = {
     "plan_create": "📋",
     "plan_update": "📋",
     "plan_status": "📋",
-    "find_latest_log": "📄",
+    "flagscale_train_monitor": "🚂",
+    "evict": "🗑️",
+    "recall": "↩️",
+
 }
 
 
@@ -293,8 +305,8 @@ def pasted_input(text: str):
     for _ in range(erase_count):
         sys.stdout.write("\033[A\033[2K")
     sys.stdout.flush()
-    first = lines[0][:100]
-    last = lines[-1][:100]
+    first = lines[0]
+    last = lines[-1]
     _print(f"  {first}")
     _print(dim(f"  ... ({len(lines)} lines)"))
     _print(f"  {last}")
@@ -302,7 +314,7 @@ def pasted_input(text: str):
 
 # ── Banner ──────────────────────────────────────────────────────────────
 
-def banner(provider, model, mode=None, context_window=None, extra_lines=None):
+def banner(provider, model, context_window=None, extra_lines=None):
     from flagscale_agent import __version__
 
     # ASCII logo
@@ -319,10 +331,9 @@ def banner(provider, model, mode=None, context_window=None, extra_lines=None):
     _print()
 
     title = f"FlagScale Agent v{__version__}"
-    mode_str = f" | Mode: {mode}" if mode else ""
     ctx_str = f" | Context: {context_window // 1000}k" if context_window else ""
-    info = f"Provider: {provider} | Model: {model}{mode_str}{ctx_str}"
-    cmds = "Commands: /skill  /plan  /save  /resume  /memory  /mode  /compact  /reload  /quit"
+    info = f"Provider: {provider} | Model: {model}{ctx_str}"
+    cmds = "Commands: /resume  /reload  /session  /quit"
     lines = [info, cmds]
     if extra_lines:
         lines.extend(extra_lines)
@@ -402,41 +413,24 @@ def thinking_clear():
     thinking_done()
 
 
-# ── Context compaction ─────────────────────────────────────────────────
-
-_last_compaction_to = 0
-_compaction_suppressed = 0
-
-
-def context_compacted(from_tokens, to_tokens, compaction_num=None, ratio=None):
-    global _last_compaction_to, _compaction_suppressed
-    # Suppress if change from last notification is < 5k tokens
-    if abs(to_tokens - _last_compaction_to) < 5000 and _last_compaction_to > 0:
-        _compaction_suppressed += 1
-        if _compaction_suppressed >= 5:
-            from_k = from_tokens // 1000
-            to_k = to_tokens // 1000
-            _print(dim(f"📦 Context compacted ×{_compaction_suppressed + 1}: now {to_k}k tokens"))
-            _compaction_suppressed = 0
-            _last_compaction_to = to_tokens
-        return
-    _compaction_suppressed = 0
-    _last_compaction_to = to_tokens
-    from_k = from_tokens // 1000
-    to_k = to_tokens // 1000
-    detail = f"{from_k}k → {to_k}k"
-    if compaction_num is not None and ratio is not None:
-        detail += f" (#{compaction_num}, target {int(ratio * 100)}%)"
-    _print(dim(f"📦 Context compacted: {detail}"))
-
 
 # ── LLM done ────────────────────────────────────────────────────────────
 
-def llm_done(elapsed, input_tokens=None, output_tokens=None):
+def llm_done(elapsed, input_tokens=None, output_tokens=None,
+             cache_read_tokens=None, cache_creation_tokens=None):
     ts = time.strftime("%H:%M:%S")
     parts = [f"[{ts}]", green("✓"), f"{elapsed:.1f}s"]
     if input_tokens is not None:
-        parts.append(f"↑{_fmt_tokens(input_tokens)}")
+        token_str = f"↑{_fmt_tokens(input_tokens)}"
+        # Show cache breakdown when caching is active
+        if cache_read_tokens or cache_creation_tokens:
+            cache_parts = []
+            if cache_read_tokens:
+                cache_parts.append(f"cache:{_fmt_tokens(cache_read_tokens)}")
+            if cache_creation_tokens:
+                cache_parts.append(f"new:{_fmt_tokens(cache_creation_tokens)}")
+            token_str += f"({'+'.join(cache_parts)})"
+        parts.append(token_str)
     if output_tokens is not None:
         parts.append(f"↓{_fmt_tokens(output_tokens)}")
     _print(dim(" | ".join(parts)))
@@ -455,12 +449,8 @@ def tool_start(name, args_summary=""):
     label = f"  {icon} {name}"
     if args_summary:
         label += f" {args_summary}"
-    tw = _term_width()
-    # For shell commands, don't truncate — show full command
-    if name == "shell":
-        _print(dim(label), end="", flush=True)
-    else:
-        _print(_truncate_to_width(dim(label), tw), end="", flush=True)
+    # Display full label without truncation for reviewer visibility
+    _print(dim(label), end="", flush=True)
     if name == "shell":
         _active_spinner = _Spinner()
         _print()
@@ -545,19 +535,9 @@ class _ParallelDisplay:
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._thread.start()
 
-    def add_extra_lines(self, count):
-        """Track lines printed below the display area by external code."""
-        with self._lock:
-            self._extra_lines += count
-
     def mark_done(self, index, elapsed, error=False, detail=""):
         with self._lock:
             self._results[index] = (elapsed, error, detail)
-
-    def update_hint(self, index, hint):
-        """Update a running tool's hint text (e.g. health check status)."""
-        with self._lock:
-            self._hints[index] = hint
 
     def _animate(self):
         while not self._stop.is_set():
@@ -652,11 +632,6 @@ def parallel_tool_update(index, elapsed, error=False, detail=""):
         _parallel_display.mark_done(index, elapsed, error, detail)
 
 
-def parallel_tool_hint(index, hint):
-    """Update a running tool's hint (e.g. health check diagnosis)."""
-    if _parallel_display and not _parallel_display._stop.is_set():
-        _parallel_display.update_hint(index, hint)
-
 
 def parallel_tools_finish():
     """Stop parallel display and do final redraw."""
@@ -680,46 +655,57 @@ def guard_overridden(guard_name, reason):
 
 
 def guard_inject(message):
-    """Display a guard inject message to the terminal (visible to user)."""
-    # Show inject messages with a distinct prefix so user can see guard activity
-    for line in message.strip().split('\n'):
-        if line.strip():
-            _print(f"  {dim('🛡')} {dim(line.strip())}")
+    """Display a guard inject message to the terminal (visible to user).
+    
+    Shows all lines with icon, subsequent lines indented to align with text.
+    No truncation for reviewer visibility.
+    """
+    lines = [l for l in message.strip().split('\n') if l.strip()]
+    if not lines:
+        return
+    _print(f"  🛡 {dim(lines[0].strip())}")
+    for line in lines[1:]:
+        _print(f"     {dim(line.strip())}")
 
 
 def guard_block(message):
-    """Display a guard block message to the terminal (visible to user)."""
-    # Show block messages prominently
-    for line in message.strip().split('\n'):
-        if line.strip():
-            _print(f"  {red('🚫')} {line.strip()}")
+    """Display a guard block message to the terminal (visible to user).
+    
+    First line: red icon + summary. Subsequent lines indented.
+    No truncation for reviewer visibility.
+    """
+    lines = [l for l in message.strip().split('\n') if l.strip()]
+    if not lines:
+        return
+    _print(f"  {red('🚫')} {lines[0].strip()}")
+    for line in lines[1:]:
+        _print(f"     {line.strip()}")
 
 
-def turn_summary(turn_num, elapsed, input_tokens, output_tokens):
+def guard_escalate(message):
+    """Display a guard escalate message to the terminal (visible to user).
+    
+    Escalate is stronger than inject but not a block — it demands attention
+    but doesn't prevent execution. No truncation for reviewer visibility.
+    """
+    lines = [l for l in message.strip().split('\n') if l.strip()]
+    if not lines:
+        return
+    _print(f"  {yellow('⚠️')} {lines[0].strip()}")
+    for line in lines[1:]:
+        _print(f"     {line.strip()}")
+
+
+def turn_summary(turn_num, elapsed, input_tokens, output_tokens,
+                 session_input_tokens=None, session_output_tokens=None):
     _stop_all_spinners()
     _print()
     parts = [f"Turn {turn_num}", f"{elapsed:.1f}s",
              f"↑{_fmt_tokens(input_tokens)} ↓{_fmt_tokens(output_tokens)}"]
+    if session_input_tokens is not None:
+        parts.append(f"Σ↑{_fmt_tokens(session_input_tokens)} ↓{_fmt_tokens(session_output_tokens or 0)}")
     _print(dim(f"── {' | '.join(parts)} ──"))
     _print()
-
-
-# ── File / session ──────────────────────────────────────────────────────
-
-# ── Skill / plan ────────────────────────────────────────────────────────
-
-def plan_summary(text):
-    for line in text.split("\n"):
-        if line.startswith("Plan:"):
-            _print(cyan(line))
-        elif line.strip().startswith("[✓]"):
-            _print(dim(line))
-        elif line.strip().startswith("[→]"):
-            _print(yellow(line))
-        elif line.startswith("Progress:"):
-            _print(dim(line))
-        else:
-            _print(line)
 
 
 def interrupted():
@@ -730,10 +716,6 @@ def interrupted():
 def goodbye():
     _stop_all_spinners()
     _print(green("\n  I'll remember where we left off. See you next time. 🚀\n"))
-
-
-def skill_auto_loaded(name):
-    _print(magenta(f"  🔧 Auto-loaded skill: {name}"))
 
 
 # ── Markdown rendering ──────────────────────────────────────────────────

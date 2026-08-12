@@ -55,8 +55,8 @@ MODEL_CONTEXT_WINDOWS = {
     "o3-mini": 200000,
     "o4-mini": 200000,
     # DeepSeek
-    "deepseek-chat": 64000,
-    "deepseek-reasoner": 64000,
+    "deepseek-chat": 200000,
+    "deepseek-reasoner": 200000,
 }
 
 
@@ -81,8 +81,7 @@ class AgentConfig:
     max_context_tokens: int = 0  # 0 = auto-detect from model
     shell_remind_interval: int = 60
     dangerous_commands_check: bool = True
-    confirm_commands: bool = True
-    mode: str = "confirm"  # "confirm" or "auto"
+    confirm_commands: bool = False
     max_output_tokens: int = 8192
     session_dir: Optional[str] = None
     auto_skill: bool = True
@@ -90,15 +89,10 @@ class AgentConfig:
     plugin_tool_dirs: List[str] = field(default_factory=list)
     skill_dirs: List[str] = field(default_factory=list)
     shell_env: Dict[str, str] = field(default_factory=dict)
-    memory_ttl_days: int = 30
     poll_detect_window: int = 2
     poll_interval: int = 15
     poll_max_duration: int = 300
-    max_auto_turns: int = 20
-    budget_max_tokens: int = 2_000_000
-    budget_max_tool_calls: int = 500
-    circuit_breaker_threshold: int = 4
-    circuit_breaker_cooldown: int = 3
+    max_continuations: int = 200
     _config_path: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -126,23 +120,17 @@ class AgentConfig:
                 self.base_url = os.environ.get("OPENAI_BASE_URL")
 
         if not self.skill_dirs:
-            from flagscale_agent.react.paths import get_skill_search_paths
+            from flagscale_agent.react.paths import get_skill_dir
             builtin_dir = os.path.join(
                 os.path.dirname(os.path.dirname(__file__)), "skills"
             )
-            self.skill_dirs = [builtin_dir] + get_skill_search_paths()
+            self.skill_dirs = [builtin_dir, get_skill_dir()]
 
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
             if var not in self.shell_env:
                 val = os.environ.get(var)
                 if val:
                     self.shell_env[var] = val
-
-        if self.mode not in ("confirm", "auto"):
-            self.mode = "confirm"
-        if self.mode == "auto":
-            self.confirm_commands = False
-            self.max_iterations = 2**31 - 1
 
     @classmethod
     def from_yaml(cls, path: str) -> "AgentConfig":
@@ -160,12 +148,10 @@ class AgentConfig:
         """Try loading from env var or default paths, then apply overrides."""
         config_path = os.environ.get("FLAGSCALE_AGENT_CONFIG")
         if not config_path:
-            from flagscale_agent.react.paths import get_config_search_paths
-            candidates = get_config_search_paths()
-            for c in candidates:
-                if os.path.isfile(c):
-                    config_path = c
-                    break
+            from flagscale_agent.react.paths import get_config_path
+            candidate = get_config_path()
+            if os.path.isfile(candidate):
+                config_path = candidate
 
         if config_path and os.path.isfile(config_path):
             config = cls.from_yaml(config_path)
@@ -189,13 +175,6 @@ class AgentConfig:
             if k in valid_fields:
                 setattr(self, k, v)
         # Re-run post-init validation
-        if self.mode not in ("confirm", "auto"):
-            self.mode = "confirm"
-        if self.mode == "auto":
-            self.confirm_commands = False
-            self.max_iterations = 2**31 - 1
-        else:
-            self.confirm_commands = True
         for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"):
             if var not in self.shell_env:
                 val = os.environ.get(var)

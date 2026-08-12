@@ -16,7 +16,7 @@
 
 import os
 
-from flagscale_agent.react.tools.base import Tool, EFFECT_WRITE_FS
+from flagscale_agent.react.tools.base import Tool
 from flagscale_agent.react.tools.read_file import get_file_cache
 
 # -- Paths that should never be written by the agent --
@@ -43,12 +43,17 @@ def _is_protected_path(path: str) -> bool:
 
 class WriteFileTool(Tool):
     name = "write_file"
-    effects = EFFECT_WRITE_FS
     description = (
         "Create or overwrite a file at the given path with the provided content. "
-        "For large files (>3000 chars), split into multiple calls using mode='append' "
-        "after the first write. Example: first call with mode='write', then subsequent "
-        "calls with mode='append' to add remaining content."
+        "IMPORTANT: Each call's content parameter MUST be under 3000 characters. "
+        "If content exceeds 3000 chars, you MUST split into multiple calls: "
+        "first call with mode='write', subsequent calls with mode='append'. "
+        "Failing to split will cause output truncation and incomplete file writes. "
+        "SPLITTING STRATEGY for large documents: Plan your sections BEFORE writing. "
+        "Write section 1 (≤3000 chars) with mode='write', then each subsequent section "
+        "with mode='append'. NEVER attempt to write an entire large document in one call — "
+        "if your content has multiple sections/chapters, split at natural boundaries (## headers). "
+        "A truncated write_file call loses ALL content including the path parameter, wasting the entire turn."
     )
     parameters = {
         "type": "object",

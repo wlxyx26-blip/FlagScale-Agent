@@ -12,98 +12,151 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ContextPressureGuard — monitors context window pressure and triggers compaction."""
+"""Context pressure guard — blocks tool calls when context is too full.
 
-from __future__ import annotations
-
-import re
+Design:
+- All detection in check_pre (before tool execution)
+- Two paths: evict path (recoverable) and hard_reset path (unrecoverable)
+- No inject — only block with clear instructions
+- Minimal state: one bool flag (_need_hard_reset)
+"""
 
 from flagscale_agent.react.guard import Guard, GuardContext, GuardVerdict
-from flagscale_agent.react.state_machine import AgentState
+
+
+# Thresholds
+BLOCK_RATIO = 0.80       # Start blocking at 80%
+RELEASE_RATIO = 0.50     # Release block when evicted below 50%
+EVICTABLE_THRESHOLD = 60 # If evictable < 60, need hard_reset instead of evict
 
 
 class ContextPressureGuard(Guard):
-    """Monitors context pressure and triggers warnings / forced compaction.
+    """Blocks tools when context pressure is too high.
 
-    Activates in all states — context pressure is always relevant.
-    Enhanced: at soft threshold, scans recent context for memory candidates.
+    Two paths:
+    - Evict path: pressure >= 80% AND evictable >= 60
+      → block until pressure < 50%
+    - Hard reset path: pressure >= 80% AND evictable < 60
+      → block until hard_reset is called
     """
 
     name = "context_pressure"
-    priority = 40
-    activate_on_states = {AgentState.EXECUTING, AgentState.PLANNING, AgentState.REVIEWING}
+    priority = 10
 
-    # ── Thresholds ──
-    _SOFT_THRESHOLD = 0.75
-    _HARD_THRESHOLD = 0.85
-    _FORCE_THRESHOLD = 0.95
+    # Tools allowed through during block
+    _SAVE_TOOLS = frozenset({
+        "memory_write", "memory_read", "memory_list",
+        "plan_update", "plan_status", "plan_create",
+        "evict", "recall",
+        "hard_reset",
+    })
 
-    def __init__(self):
-        self._soft_warned: bool = False
-        self._hard_warned: bool = False
+    def __init__(self, working_window_tokens: int = 0):
+        self._need_hard_reset = False
+        self._working_window_tokens = working_window_tokens
+
+    @property
+    def working_window_tokens(self) -> int:
+        return self._working_window_tokens or 120_000
+
+    def check_pre(self, ctx: GuardContext) -> GuardVerdict | None:
+        # Skip the pre-LLM-call check (tool_name=""). We only gate actual tool
+        # executions — blocking before the LLM call would prevent the LLM from
+        # ever invoking evict/hard_reset, creating an infinite block loop.
+        if not ctx.tool_name:
+            return None
+
+        pressure = ctx.context_pressure
+        if pressure <= 0:
+            return None
+
+        evictable = ctx.evictable_indexes
+        pct = int(pressure * 100)
+
+        # Hard reset path — auto-release if conditions have recovered
+        if self._need_hard_reset:
+            # Recovery check: if evictable grew back above threshold OR
+            # pressure dropped below block ratio, release the lock
+            if len(evictable) >= EVICTABLE_THRESHOLD or pressure < BLOCK_RATIO:
+                self._need_hard_reset = False
+                # Fall through to normal threshold check below
+            else:
+                if ctx.tool_name in self._SAVE_TOOLS:
+                    return None
+                return GuardVerdict.block(
+                    f"[Context pressure {pct}% with only "
+                    f"{len(evictable)} evictable messages] "
+                    f"Eviction cannot free enough space. Execute in order:\n"
+                    f"1. memory_write() — save key findings\n"
+                    f"2. plan_update(notes='...') — record current state\n"
+                    f"3. hard_reset(reason='...') — reset context\n"
+                    f"Allowed tools: {', '.join(sorted(self._SAVE_TOOLS))}",
+                    reason="hard_reset_required",
+                    category="context_pressure_hard_reset",
+                )
+
+        # Below block threshold — pass
+        if pressure < BLOCK_RATIO:
+            return None
+
+        # At or above 80% — decide which path
+        if len(evictable) < EVICTABLE_THRESHOLD:
+            # Not enough to evict — need hard_reset
+            self._need_hard_reset = True
+            if ctx.tool_name in self._SAVE_TOOLS:
+                return None
+            return GuardVerdict.block(
+                f"[Context pressure {pct}% with only "
+                f"{len(evictable)} evictable messages] "
+                f"Eviction cannot free enough space. Execute in order:\n"
+                f"1. memory_write() — save key findings\n"
+                f"2. plan_update(notes='...') — record current state\n"
+                f"3. hard_reset(reason='...') — reset context\n"
+                f"Allowed tools: {', '.join(sorted(self._SAVE_TOOLS))}",
+                reason="hard_reset_required",
+                category="context_pressure_hard_reset",
+            )
+        else:
+            # Enough to evict — block until pressure < 50%
+            if ctx.tool_name in self._SAVE_TOOLS:
+                return None
+            return GuardVerdict.block(
+                f"[Context pressure {pct}% with "
+                f"{len(evictable)} evictable messages] "
+                f"Evict aggressively until pressure drops below 50%. "
+                f"Call evict(indexes=[...]) with wide ranges.\n"
+                f"1. memory_write() / plan_update() — save progress first\n"
+                f"2. evict(indexes=[...]) — free context space\n"
+                f"Evictable: {evictable}\n"
+                f"Allowed tools: {', '.join(sorted(self._SAVE_TOOLS))}",
+                reason="evict_required",
+                category="context_pressure_evict",
+            )
 
     def check_post(self, ctx: GuardContext) -> GuardVerdict | None:
-        pressure = ctx.context_pressure
-
-        if pressure >= self._FORCE_THRESHOLD:
-            return GuardVerdict.compact(
-                reason=f"pressure at {pressure:.0%}",
-            )
-
-        if pressure >= self._HARD_THRESHOLD and not self._hard_warned:
-            self._hard_warned = True
-            candidates = self._suggest_memory_candidates(ctx)
-            suggestion = ""
-            if candidates:
-                suggestion = " Suggested to memorize: " + "; ".join(candidates[:3])
-            return GuardVerdict.inject(
-                f"[ContextPressure] Context at {pressure:.0%}. "
-                f"Write key findings to memory NOW — compaction is imminent.{suggestion}",
-                reason=f"hard threshold reached: {pressure:.0%}",
-            )
-
-        if pressure >= self._SOFT_THRESHOLD and not self._soft_warned:
-            self._soft_warned = True
-            candidates = self._suggest_memory_candidates(ctx)
-            suggestion = ""
-            if candidates:
-                suggestion = " Candidates: " + "; ".join(candidates[:3])
-            return GuardVerdict.inject(
-                f"[ContextPressure] Context at {pressure:.0%}. "
-                f"Consider writing intermediate results to memory.{suggestion}",
-                reason=f"soft threshold reached: {pressure:.0%}",
-            )
-
+        """Reset _need_hard_reset after hard_reset or successful eviction."""
+        if self._need_hard_reset:
+            if ctx.tool_name == "hard_reset":
+                self._need_hard_reset = False
+            elif ctx.tool_name == "evict":
+                # After eviction, re-check if conditions improved
+                pressure = ctx.context_pressure
+                evictable = ctx.evictable_indexes
+                if len(evictable) >= EVICTABLE_THRESHOLD or pressure < BLOCK_RATIO:
+                    self._need_hard_reset = False
         return None
 
-    def _suggest_memory_candidates(self, ctx: GuardContext) -> list[str]:
-        """Scan recent tool results for memory-worthy content (heuristic, no LLM)."""
-        candidates = []
-        # Access recent messages from context if available
-        recent_text = ctx.tool_result or ""
-        if not recent_text and hasattr(ctx, "recent_outputs"):
-            recent_text = str(ctx.recent_outputs)
+    def accept_override(self, reason: str, ctx: GuardContext) -> bool:
+        """Accept override and clear the block state.
 
-        # Pattern 1: Error resolutions
-        if re.search(r'(?:fixed|solved|resolved|workaround)', recent_text, re.IGNORECASE):
-            candidates.append("error workaround found in recent output")
-
-        # Pattern 2: Path discoveries
-        paths = re.findall(r'/[\w/.-]{15,}(?:\.py|\.yaml|\.json|\.pt|\.safetensors)', recent_text)
-        if paths:
-            candidates.append(f"path: {paths[0][:80]}")
-
-        # Pattern 3: Configuration decisions
-        if re.search(r'(?:changed|set|using)\s+(?:tp|dp|pp|batch|lr|seq.len)', recent_text, re.IGNORECASE):
-            candidates.append("configuration decision")
-
-        # Pattern 4: Numerical results
-        if re.search(r'(?:loss|throughput|tokens.per.sec)\s*[:=]\s*[\d.]+', recent_text, re.IGNORECASE):
-            candidates.append("training metrics")
-
-        return candidates
+        When an override is accepted, clear _need_hard_reset so subsequent
+        tool calls aren't blocked again. Without this, the LLM would need
+        to override every single call — the override doesn't "stick".
+        """
+        accepted = bool(reason and len(reason.strip()) > 5)
+        if accepted:
+            self._need_hard_reset = False
+        return accepted
 
     def reset_turn(self):
-        # Context pressure warnings fire at most once per session threshold crossing.
-        # Do NOT reset warned flags — they are session-level.
         pass

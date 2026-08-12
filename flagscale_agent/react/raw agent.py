@@ -94,7 +94,6 @@ from flagscale_agent.react.tool_executor import ToolExecutor, tool_display_summa
 
 from flagscale_agent.react.judge import Judge
 from flagscale_agent.react.commands import CommandHandler
-from flagscale_agent.trace_logger import trace_logger
 
 
 # ── WorkerAgent ──────────────────────────────────────────────────────────────
@@ -192,9 +191,6 @@ class WorkerAgent:
         self._session_input_tokens: int = 0
         self._session_output_tokens: int = 0
 
-        # ATIF/native trace step sequence.
-        # One LLM assistant response corresponds to one trace step.
-        self._trace_step_id: int = 0
 
         self._last_checkpoint_tokens: int = 0
         self._last_tool_call: tuple | None = None
@@ -986,132 +982,24 @@ class WorkerAgent:
                              session_input_tokens=self._session_input_tokens,
                              session_output_tokens=self._session_output_tokens)
 
-    @staticmethod
-    def _classify_trace_tool_result(result) -> dict:
-        """Classify a tool result for ATIF trajectory metadata."""
-        text = "" if result is None else str(result)
-        stripped = text.lstrip()
-
-        status = "success"
-        is_error = False
-        skip_reason = None
-        error_message = None
-        intended_execution = True
-
-        # Tool was blocked by Kernel guard before actual execution.
-        if stripped.startswith("[BLOCKED BY GUARD]"):
-            status = "blocked"
-            skip_reason = "guard_blocked"
-            intended_execution = False
-
-        # ToolExecutor skipped an identical call in the same batch.
-        elif stripped.startswith("[DEDUP:"):
-            status = "skipped"
-            skip_reason = "deduplicated"
-            intended_execution = False
-
-        # ToolExecutor refused to execute calls beyond the batch limit.
-        elif stripped.startswith("[BATCH CAPPED"):
-            status = "capped"
-            skip_reason = "batch_capped"
-            intended_execution = False
-
-        # Result was reused from the per-turn cache.
-        elif "[Cached result from earlier in this turn]" in text:
-            status = "cached"
-
-        # Explicit denial.
-        elif stripped.startswith("DENIED:"):
-            status = "denied"
-            is_error = True
-            error_message = stripped.splitlines()[0]
-
-        # Tool execution failures.
-        elif (
-            stripped.startswith(
-                (
-                    "ERROR:",
-                    "FATAL:",
-                    "STALLED:",
-                    "TERMINATED:",
-                    "Error executing tool:",
-                )
-            )
-            or "Traceback (most recent call last)" in text
-        ):
-            status = "error"
-            is_error = True
-            error_message = (
-                stripped.splitlines()[0]
-                if stripped
-                else "tool execution failed"
-            )
-
-        return {
-            "content": text,
-            "extra": {
-                "status": status,
-                "is_error": is_error,
-                "skip_reason": skip_reason,
-                "error_message": error_message,
-                "intended_execution": intended_execution,
-            },
-        }
-
     def _on_kernel_response(self, response: dict):
-        """Record one assistant response and its native tool calls."""
-        self._trace_step_id += 1
-        step_id = self._trace_step_id
-
-        trace_logger.emit(
-            "assistant_response",
-            step_id=step_id,
-            turn_id=self.turn_count,
-            content=response.get("content"),
-            truncated=bool(response.get("truncated", False)),
-        )
-
-        # Preserve provider/model-native tool call IDs.
-        for tc in response.get("tool_calls") or []:
-            trace_logger.emit(
-                "tool_call",
-                step_id=step_id,
-                turn_id=self.turn_count,
-                tool_call_id=str(tc.get("id") or ""),
-                function_name=str(tc.get("name") or ""),
-                arguments=tc.get("arguments") or {},
-            )
+        """Called by Kernel after LLM response is appended to history."""
+        pass
 
     def _on_kernel_tool_results(self, tool_calls: list, results: list):
-        """Record tool observations and keep existing Agent bookkeeping."""
-        step_id = self._trace_step_id
-
-        for tc, result in zip(tool_calls, results):
-            classified = self._classify_trace_tool_result(result)
-
-            trace_logger.emit(
-                "tool_result",
-                step_id=step_id,
-                turn_id=self.turn_count,
-                source_call_id=str(tc.get("id") or ""),
-                function_name=str(tc.get("name") or ""),
-                content=classified["content"],
-                extra=classified["extra"],
-            )
-
-        # Existing WorkerAgent bookkeeping.
+        """Called by Kernel after tool execution and guard checks."""
+        # Track tool calls
         for tc in tool_calls:
             self._last_tool_calls_deque.append(tc["name"])
         self._total_iterations += 1
 
-        # Refresh system prompt if plan tools were used.
-        if any(
-            tc["name"] in ("plan_create", "plan_update", "plan_status")
-            for tc in tool_calls
-        ):
+        # Refresh system prompt if plan tools were used
+        if any(tc["name"] in ("plan_create", "plan_update", "plan_status")
+               for tc in tool_calls):
             self._refresh_system_prompt()
 
-        # Context pressure warning is handled by ContextPressureGuard.
+        # Context pressure warning is handled by ContextPressureGuard - no duplicate check here
+
         self._tool_call_cache = {}
         print()
 
