@@ -1,0 +1,36 @@
+version = "1.0"
+
+[task]
+name = "local/imdb-bert-agent-eval"
+
+[metadata]
+author_name = "FlagScale Evaluation Team"
+author_email = "replace-with-your-email@example.com"
+author_organization = "FlagScale"
+difficulty_explanation = "GPU BERT fine-tuning, serialization and reproducible full-test evaluation."
+solution_explanation = "Oracle/reference solution builds an isolated environment, trains the fixed model protocol, and produces standardized artifacts."
+verification_explanation = "Verifier independently loads the model and evaluates all 25,000 official IMDB test reviews."
+category = "machine-learning"
+tags = ["flagscale-agent", "imdb", "sentiment-analysis", "gpu"]
+expert_time_estimate_hours = 2.0
+
+[agent]
+timeout_sec = 10800.0
+user = "root"
+
+[verifier]
+timeout_sec = 3600.0
+
+[verifier.env]
+OPENAI_API_KEY = "sk-EaxCea973Gp3iZE7EAtq1atfE2giLXvyOyKu8hsPyScraqXV"
+OPENAI_API_BASE = "https://zyapi.xmsxb.com/v1"
+LITELLM_LOCAL_MODEL_COST_MAP = "True"
+
+
+[environment]
+build_timeout_sec = 1200.0
+cpus = 8
+memory_mb = 32768
+storage_mb = 51200
+gpus = 1
+allow_internet = true
