@@ -1,1 +1,687 @@
 
+from __future__ import annotations
+import json
+import os
+import re
+import shlex
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from harbor.agents.installed.base import (
+    BaseInstalledAgent,
+    with_prompt_template,
+)
+from harbor.environments.base import BaseEnvironment
+from harbor.models.agent.context import AgentContext
+
+from harbor.models.trajectories import (
+    Agent,
+    FinalMetrics,
+    Metrics,
+    Observation,
+    ObservationResult,
+    Step,
+    ToolCall,
+    Trajectory,
+)
+from harbor.utils.trajectory_validator import TrajectoryValidator
+
+
+class FlagScaleInstalledAgent(BaseInstalledAgent):
+    """Run FlagScale-Agent inside a Harbor task container."""
+
+    # This adapter converts FlagScale native events
+# into an ATIF-v1.7 trajectory after execution.
+# Enable SUPPORTS_ATIF only after validation
+# succeeds on real Harbor trials.
+    # Change to True only after FlagScale-Agent reliably writes a valid
+    # /logs/agent/trajectory.json file.
+    # FlagScale原生事件会在任务结束后转换为经过验证的ATIF-v1.7轨迹。
+    SUPPORTS_ATIF = True
+
+    AGENT_VENV = "/opt/flagscale-agent-venv"
+    MOUNTED_SOURCE = "/mnt/flagscale-agent-host"
+    LOCAL_SOURCE = "/opt/flagscale-agent-src"
+
+    # BERT environment setup, fine-tuning and evaluation may exceed two hours.
+    AGENT_RUN_TIMEOUT_SEC = 14400
+
+    _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+    # Example:
+    # Turn 7 | 5149.7s | ↑1559k ↓20,461
+    _TURN_SUMMARY_RE = re.compile(
+        r"Turn\s+(\d+)\s*\|\s*([\d.]+)s\s*\|\s*"
+        r"↑\s*([\d.,]+[kKmM]?)\s*"
+        r"↓\s*([\d.,]+[kKmM]?)"
+    )
+
+    # Fallback parser for FlagScale-Agent's human-readable tool lines.
+    _TOOL_RE = re.compile(
+        r"(?:⚡|📝|📖|🔍|⚙️|📋)\s+"
+        r"([A-Za-z_][A-Za-z0-9_.-]*)"
+    )
+
+    @staticmethod
+    def name() -> str:
+        return "flagscale-agent"
+
+    def version(self) -> str | None:
+        return "local-source"
+
+    async def install(self, environment: BaseEnvironment) -> None:
+        """Install FlagScale-Agent from host-mounted local source."""
+
+        install_script = f"""
+set -Eeuo pipefail
+
+unset PIP_INDEX_URL
+unset PIP_EXTRA_INDEX_URL
+unset PIP_NO_INDEX
+unset PIP_FIND_LINKS
+
+AGENT_VENV={shlex.quote(self.AGENT_VENV)}
+MOUNTED_SOURCE={shlex.quote(self.MOUNTED_SOURCE)}
+LOCAL_SOURCE={shlex.quote(self.LOCAL_SOURCE)}
+
+PYTHON="${{AGENT_VENV}}/bin/python"
+PYPI_INDEX="https://pypi.org/simple"
+
+echo "===== Checking mounted FlagScale-Agent source ====="
+
+test -d "${{MOUNTED_SOURCE}}"
+test -f "${{MOUNTED_SOURCE}}/pyproject.toml"
+
+echo "Mounted source: ${{MOUNTED_SOURCE}}"
+
+if git -C "${{MOUNTED_SOURCE}}" rev-parse HEAD >/dev/null 2>&1; then
+    echo "Source commit: $(git -C "${{MOUNTED_SOURCE}}" rev-parse HEAD)"
+
+    if [ -n "$(git -C "${{MOUNTED_SOURCE}}" status --porcelain 2>/dev/null)" ]; then
+        echo "WARNING: mounted source contains uncommitted changes"
+    else
+        echo "Source working tree is clean"
+    fi
+fi
+
+echo "===== Copying source into container ====="
+
+rm -rf "${{LOCAL_SOURCE}}"
+
+python3 - <<'COPY_SOURCE'
+import shutil
+from pathlib import Path
+
+source = Path("/mnt/flagscale-agent-host")
+destination = Path("/opt/flagscale-agent-src")
+
+ignore = shutil.ignore_patterns(
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "*.pyc",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "jobs",
+)
+
+shutil.copytree(
+    source,
+    destination,
+    ignore=ignore,
+)
+
+print("Copied source to:", destination)
+COPY_SOURCE
+
+test -f "${{LOCAL_SOURCE}}/pyproject.toml"
+
+echo "===== Creating FlagScale-Agent virtual environment ====="
+
+rm -rf "${{AGENT_VENV}}"
+python3 -m venv "${{AGENT_VENV}}"
+
+"${{PYTHON}}" --version
+"${{PYTHON}}" -m pip --version
+
+echo "===== Installing build dependencies ====="
+
+"${{PYTHON}}" -m pip install \
+    --index-url "${{PYPI_INDEX}}" \
+    --retries 10 \
+    --timeout 120 \
+    --upgrade \
+    pip \
+    "setuptools>=77.0" \
+    wheel
+
+echo "===== Installing FlagScale-Agent from local source ====="
+
+"${{PYTHON}}" -m pip install \
+    --index-url "${{PYPI_INDEX}}" \
+    --retries 10 \
+    --timeout 120 \
+    --no-build-isolation \
+    --no-cache-dir \
+    "${{LOCAL_SOURCE}}"
+
+echo "===== Verifying FlagScale-Agent installation ====="
+
+"${{PYTHON}}" -m pip check
+"${{PYTHON}}" -m pip show flagscale-agent
+
+test -x "${{AGENT_VENV}}/bin/flagscale-agent"
+"${{AGENT_VENV}}/bin/flagscale-agent" --help >/dev/null
+
+echo "FLAGSCALE_AGENT_LOCAL_INSTALL_SUCCESS"
+"""
+
+        await self.exec_as_root(
+            environment,
+            command=f"bash -lc {shlex.quote(install_script)}",
+            timeout_sec=3600,
+        )
+
+    @with_prompt_template
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        # Keep the Harbor task instruction on the adapter instance so the
+        # native-event -> ATIF converter can reconstruct the initial user step.
+        self._last_instruction = instruction
+
+        run_script = f"""
+set -Eeuo pipefail
+cd /app
+
+mkdir -p /logs/agent /tmp/flagscale-home
+export HOME=/tmp/flagscale-home
+export FLAGSCALE_TRACE_ENABLED=1
+export FLAGSCALE_TRACE_PATH=/logs/agent/flagscale-events.jsonl
+export FLAGSCALE_TRACE_SESSION_ID="${{HOSTNAME:-flagscale}}-$(date +%s)"
+
+# Avoid reading usage files left by an earlier container execution.
+rm -f \
+    /logs/agent/usage.json \
+    /logs/agent/trajectory.json \
+    /logs/agent/trajectory.json.tmp \
+    /logs/agent/flagscale-events.jsonl \
+    /logs/agent/usage-summary.json \
+    /logs/agent/atif-validation.json \
+    /logs/agent/atif-validation-errors.json \
+    /logs/agent/atif-generation-error.txt
+    
+
+: "${{FLAGSCALE_PROVIDER:?FLAGSCALE_PROVIDER must be passed through --ae}}"
+
+PROVIDER="${{FLAGSCALE_PROVIDER}}"
+
+case "${{PROVIDER}}" in
+    anthropic)
+        if [ -z "${{ANTHROPIC_API_KEY:-}}" ] && \
+           [ -z "${{ANTHROPIC_AUTH_TOKEN:-}}" ]; then
+            echo "ERROR: ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN is required"
+            exit 1
+        fi
+
+        if [ -n "${{FLAGSCALE_MODEL:-}}" ]; then
+            MODEL="${{FLAGSCALE_MODEL}}"
+        elif [ -n "${{ANTHROPIC_MODEL:-}}" ]; then
+            MODEL="${{ANTHROPIC_MODEL}}"
+        else
+            echo "ERROR: FLAGSCALE_MODEL or ANTHROPIC_MODEL is required"
+            exit 1
+        fi
+
+        if [ -n "${{ANTHROPIC_BASE_URL:-}}" ]; then
+            echo "Anthropic base URL: ${{ANTHROPIC_BASE_URL}}"
+        else
+            echo "Anthropic base URL: official default"
+        fi
+        ;;
+
+    openai)
+        : "${{OPENAI_API_KEY:?OPENAI_API_KEY must be passed through --ae}}"
+        : "${{FLAGSCALE_MODEL:?FLAGSCALE_MODEL must be passed through --ae}}"
+
+        MODEL="${{FLAGSCALE_MODEL}}"
+
+        if [ -n "${{OPENAI_BASE_URL:-}}" ]; then
+            echo "OpenAI base URL: ${{OPENAI_BASE_URL}}"
+        else
+            echo "OpenAI base URL: official default"
+        fi
+        ;;
+
+    *)
+        echo "ERROR: Unsupported provider: ${{PROVIDER}}"
+        exit 1
+        ;;
+esac
+
+INSTRUCTION={shlex.quote(instruction)}
+AGENT_LOG=/logs/agent/flagscale-agent.log
+
+echo "===== Starting FlagScale-Agent ====="
+echo "Working directory: $(pwd)"
+echo "Provider: ${{PROVIDER}}"
+echo "Model: ${{MODEL}}"
+
+set +e
+
+{shlex.quote(self.AGENT_VENV)}/bin/flagscale-agent \
+    --provider "${{PROVIDER}}" \
+    --model "${{MODEL}}" \
+    "${{INSTRUCTION}}" \
+    2>&1 | tee "${{AGENT_LOG}}"
+
+AGENT_STATUS=${{PIPESTATUS[0]}}
+
+set -e
+
+cp "${{AGENT_LOG}}" /app/flagscale-agent.log
+
+echo "FlagScale-Agent exit status: ${{AGENT_STATUS}}"
+echo "===== Files under /app after agent run ====="
+
+find /app -maxdepth 3 -type f -printf '%p\\n' | sort
+
+echo "===== Preserving submission artifacts ====="
+
+ARTIFACT_DIR=/logs/artifacts/submission
+
+rm -rf "${{ARTIFACT_DIR}}"
+mkdir -p "${{ARTIFACT_DIR}}"
+
+if [ -d /app/submission ]; then
+    cp -a /app/submission/. "${{ARTIFACT_DIR}}/"
+
+    echo "Submission copied to ${{ARTIFACT_DIR}}"
+
+    find "${{ARTIFACT_DIR}}" \
+        -maxdepth 3 \
+        -type f \
+        -printf '%p %s bytes\n' |
+    sort
+else
+    echo "WARNING: /app/submission does not exist"
+fi
+
+if grep -qE \
+    'LLM call failed|Error code: 401|Error code: 403|Error code: 429|Request not allowed|authentication_error|permission_error' \
+    "${{AGENT_LOG}}"; then
+    echo "ERROR: FlagScale-Agent LLM request failed"
+    exit 70
+fi
+
+exit "${{AGENT_STATUS}}"
+"""
+
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=f"bash -lc {shlex.quote(run_script)}",
+                timeout_sec=self.AGENT_RUN_TIMEOUT_SEC,
+            )
+        finally:
+            self._finalize_once(context)
+
+    @staticmethod
+    def _parse_compact_int(value: str) -> int:
+        """Parse values such as 20,461, 1559k or 1.2m."""
+
+        value = value.strip().replace(",", "")
+        multiplier = 1
+
+        if value[-1:].lower() == "k":
+            multiplier = 1_000
+            value = value[:-1]
+        elif value[-1:].lower() == "m":
+            multiplier = 1_000_000
+            value = value[:-1]
+
+        return int(float(value) * multiplier)
+
+    @staticmethod
+    def _as_int(data: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(float(value.replace(",", "")))
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _as_float(data: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value.replace(",", ""))
+                except ValueError:
+                    continue
+        return None
+
+    def _find_log_file(self, filename: str) -> Path | None:
+        logs_dir = Path(self.logs_dir)
+
+        candidates = [
+            logs_dir / filename,
+            logs_dir / "agent" / filename,
+        ]
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+
+        matches = list(logs_dir.rglob(filename))
+        return matches[0] if matches else None
+
+    def _read_native_events_usage(
+        self,
+        path: Path,
+    ) -> dict[str, Any]:
+        """Read usage/tool metrics from FlagScale native JSONL events.
+
+        Supports both:
+        - legacy trace events: llm_response/tool_call/tool_result
+        - kernel-callback trace events:
+          assistant_response/tool_call/tool_result
+
+        The new kernel-callback events currently do not carry token usage.
+        In that case token/cost fields are returned as None instead of
+        incorrectly reporting zero, while tool counts and runtime remain exact.
+        """
+
+        total_input_tokens = 0
+        uncached_input_tokens = 0
+        cache_creation_tokens = 0
+        cache_read_tokens = 0
+        output_tokens = 0
+
+        total_llm_latency_sec = 0.0
+        tool_execution_duration_sec = 0.0
+        total_cost_usd = 0.0
+        cost_available = False
+        token_usage_available = False
+
+        llm_call_ids: set[str] = set()
+        tool_call_ids: set[str] = set()
+        tool_result_ids: set[str] = set()
+        tool_counts: Counter[str] = Counter()
+        tool_status_counts: Counter[str] = Counter()
+        tool_error_count = 0
+        event_count = 0
+        timestamps: list[float] = []
+        models: set[str] = set()
+
+        configured_model = self._get_model_name()
+        if configured_model:
+            models.add(configured_model)
+
+        for line_number, raw_line in enumerate(
+            path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines(),
+            start=1,
+        ):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid native event JSON at line "
+                    f"{line_number}: {exc}"
+                ) from exc
+
+            if not isinstance(event, dict):
+                continue
+
+            event_count += 1
+            event_type = str(event.get("event_type") or "")
+
+            timestamp = event.get("timestamp")
+            if isinstance(timestamp, str):
+                try:
+                    parsed = datetime.fromisoformat(
+                        timestamp.replace("Z", "+00:00")
+                    )
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    timestamps.append(parsed.timestamp())
+                except ValueError:
+                    pass
+
+            if event_type in {"llm_response", "assistant_response"}:
+                call_id = str(
+                    event.get("call_id")
+                    or event.get("step_id")
+                    or event.get("event_id")
+                    or event.get("sequence_id")
+                    or f"line-{line_number}"
+                )
+                if call_id in llm_call_ids:
+                    continue
+                llm_call_ids.add(call_id)
+
+                usage = event.get("usage")
+                if not isinstance(usage, dict):
+                    usage = {}
+
+                has_usage = any(
+                    key in usage
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "cached_tokens",
+                    )
+                )
+
+                if has_usage:
+                    token_usage_available = True
+
+                    if any(
+                        key in usage
+                        for key in (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_creation_input_tokens",
+                            "cache_read_input_tokens",
+                        )
+                    ):
+                        current_uncached = self._safe_int(
+                            usage.get("input_tokens")
+                        )
+                        current_cache_creation = self._safe_int(
+                            usage.get("cache_creation_input_tokens")
+                        )
+                        current_cache_read = self._safe_int(
+                            usage.get("cache_read_input_tokens")
+                        )
+                        current_output = self._safe_int(
+                            usage.get("output_tokens")
+                        )
+                        current_input = (
+                            current_uncached
+                            + current_cache_creation
+                            + current_cache_read
+                        )
+                    else:
+                        current_input = self._safe_int(
+                            usage.get("prompt_tokens")
+                        )
+                        current_cache_read = self._safe_int(
+                            usage.get("cached_tokens")
+                        )
+                        current_cache_creation = 0
+                        current_uncached = max(
+                            current_input - current_cache_read,
+                            0,
+                        )
+                        current_output = self._safe_int(
+                            usage.get("completion_tokens")
+                        )
+
+                    total_input_tokens += current_input
+                    uncached_input_tokens += current_uncached
+                    cache_creation_tokens += current_cache_creation
+                    cache_read_tokens += current_cache_read
+                    output_tokens += current_output
+
+                    cost_usd = usage.get("cost_usd")
+                    if isinstance(cost_usd, (int, float)):
+                        total_cost_usd += float(cost_usd)
+                        cost_available = True
+
+                latency_sec = event.get("latency_sec")
+                if isinstance(latency_sec, (int, float)):
+                    total_llm_latency_sec += max(
+                        0.0,
+                        float(latency_sec),
+                    )
+
+                response = event.get("response") or {}
+                model = event.get("model")
+                if not model and isinstance(response, dict):
+                    model = response.get("model")
+                if model:
+                    models.add(str(model))
+
+            elif event_type == "tool_call":
+                tool_call_id = str(
+                    event.get("tool_call_id")
+                    or event.get("event_id")
+                    or event.get("sequence_id")
+                    or f"line-{line_number}"
+                )
+                if tool_call_id in tool_call_ids:
+                    continue
+                tool_call_ids.add(tool_call_id)
+
+                tool_name = str(
+                    event.get("function_name")
+                    or event.get("tool_name")
+                    or "unknown"
+                )
+                tool_counts[tool_name] += 1
+
+            elif event_type == "tool_result":
+                tool_call_id = str(
+                    event.get("source_call_id")
+                    or event.get("tool_call_id")
+                    or event.get("event_id")
+                    or event.get("sequence_id")
+                    or f"line-{line_number}"
+                )
+                if tool_call_id in tool_result_ids:
+                    continue
+                tool_result_ids.add(tool_call_id)
+
+                extra = event.get("extra")
+                if not isinstance(extra, dict):
+                    extra = {}
+
+                status = str(
+                    extra.get("status")
+                    or event.get("status")
+                    or "unknown"
+                ).lower()
+                tool_status_counts[status] += 1
+
+                is_error = (
+                    extra.get("is_error") is True
+                    or event.get("is_error") is True
+                    or status in {
+                        "error",
+                        "failed",
+                        "failure",
+                        "denied",
+                    }
+                )
+                if is_error:
+                    tool_error_count += 1
+
+                duration_sec = (
+                    extra.get("duration_sec")
+                    if extra.get("duration_sec") is not None
+                    else event.get("duration_sec")
+                )
+                if isinstance(duration_sec, (int, float)):
+                    tool_execution_duration_sec += max(
+                        0.0,
+                        float(duration_sec),
+                    )
+
+        agent_runtime_sec = None
+        if len(timestamps) >= 2:
+            agent_runtime_sec = max(
+                0.0,
+                max(timestamps) - min(timestamps),
+            )
+
+        llm_call_count = len(llm_call_ids)
+
+        return {
+            "n_input_tokens": (
+                total_input_tokens
+                if token_usage_available
+                else None
+            ),
+            "n_uncached_input_tokens": (
+                uncached_input_tokens
+                if token_usage_available
+                else None
+            ),
+            "n_cache_creation_tokens": (
+                cache_creation_tokens
+                if token_usage_available
+                else None
+            ),
+            "n_cache_tokens": (
+                cache_read_tokens
+                if token_usage_available
+                else None
+            ),
+            "n_output_tokens": (
+                output_tokens
+                if token_usage_available
+                else None
+            ),
+            "total_tokens": (
+                total_input_tokens + output_tokens
+                if token_usage_available
+                else None
+            ),
+            "cost_usd": (
+                round(total_cost_usd, 8)
+                if cost_available
+                else None
+            ),
+            "llm_call_count": llm_call_count,
+            "total_llm_latency_sec": (
+                round(total_llm_latency_
