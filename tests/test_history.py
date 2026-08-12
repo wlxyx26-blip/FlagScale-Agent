@@ -16,8 +16,7 @@
 
 from flagscale_agent.react.history import (
     HistoryManager, _estimate_tokens, _message_tokens,
-    _is_tool_result, _has_tool_use, _collect_droppable,
-    _smart_truncate, _age_message, _age_tool_results,
+    _is_tool_result, _has_tool_use,
 )
 
 
@@ -104,11 +103,14 @@ class TestHistoryManager:
         assert any(m["role"] == "user" and m["content"] == "recent" for m in msgs)
 
     def test_compaction_flag(self):
+        """V3: compaction no longer happens — get_messages returns messages unchanged."""
         hm = HistoryManager(max_context_tokens=100)
         hm.append({"role": "system", "content": "sys"})
         hm.append({"role": "user", "content": "x" * 5000})
-        hm.get_messages()
-        assert hm.compaction_happened
+        msgs = hm.get_messages()
+        # V3: no compaction, messages returned as-is
+        assert not hm.compaction_happened
+        assert any("x" * 100 in m.get("content", "") for m in msgs)
 
     def test_no_compaction_under_budget(self):
         hm = HistoryManager(max_context_tokens=100000)
@@ -117,30 +119,16 @@ class TestHistoryManager:
         hm.get_messages()
         assert not hm.compaction_happened
 
-    def test_summarizer_called_on_compaction(self):
-        called = []
-        def fake_summarizer(text):
-            called.append(text)
-            return "Summary: stuff happened"
-
+    def test_no_automatic_compaction_in_v3(self):
+        """V3: no automatic compaction — messages are never modified on append."""
         hm = HistoryManager(max_context_tokens=100)
-        hm.set_summarizer(fake_summarizer)
         hm.append({"role": "system", "content": "sys"})
         hm.append({"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""})
         hm.append({"role": "tool", "tool_call_id": "1", "content": "x" * 5000})
         hm.append({"role": "user", "content": "recent"})
         msgs = hm.get_messages()
-        assert len(called) > 0
-        # Summary should be injected (may be merged with adjacent user message)
-        def _has_summary(m):
-            c = m.get("content", "")
-            if isinstance(c, str):
-                return "<context-summary>" in c
-            if isinstance(c, list):
-                return any("<context-summary>" in (b.get("text", "") if isinstance(b, dict) else "") for b in c)
-            return False
-        summary_msgs = [m for m in msgs if _has_summary(m)]
-        assert len(summary_msgs) == 1
+        # V3: content unchanged, no summarization or truncation
+        assert any("x" * 100 in m.get("content", "") for m in msgs)
 
     def test_orphaned_tool_result_removed(self):
         hm = HistoryManager(max_context_tokens=100000)
@@ -229,178 +217,53 @@ class TestMergeConsecutiveUserMessages:
         assert any(b.get("type") == "text" and "follow up" in b.get("text", "") for b in content)
 
 
-class TestCollectDroppable:
-    def test_preserves_system(self):
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "x" * 10000},
-        ]
-        _, kept = _collect_droppable(messages, budget=10)
-        assert kept[0]["role"] == "system"
 
-    def test_under_budget_no_change(self):
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "hi"},
-        ]
-        dropped, kept = _collect_droppable(messages, budget=100000)
-        assert len(kept) == 2
-        assert len(dropped) == 0
-
-    def test_drops_openai_tool_pair(self):
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""},
-            {"role": "tool", "tool_call_id": "1", "content": "x" * 5000},
-            {"role": "user", "content": "recent"},
-        ]
-        dropped, kept = _collect_droppable(messages, budget=10)
-        assert kept[-1]["content"] == "recent"
-        assert not any(m.get("role") == "tool" for m in kept)
-
-    def test_fallback_drops_when_still_over(self):
-        """Even after truncation, if still over budget, drop old pairs."""
-        hm = HistoryManager(max_context_tokens=50)
-        hm.append({"role": "system", "content": "s"})
-        # Old pair
-        hm.append({"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""})
-        hm.append({"role": "tool", "tool_call_id": "1", "content": "x" * 5000})
-        # Recent
-        hm.append({"role": "user", "content": "hi"})
-        msgs = hm.get_messages()
-        # Should not contain the old tool result
-        assert not any(m.get("role") == "tool" and "xxxxx" in m.get("content", "") for m in msgs)
-
-
-class TestSmartTruncate:
-    def test_short_content_unchanged(self):
-        assert _smart_truncate("hello world") == "hello world"
-
-    def test_long_content_truncated(self):
-        big = "\n".join(f"line {i}" for i in range(200))
-        result = _smart_truncate(big, max_chars=300)
-        assert len(result) < len(big)
-        assert "omitted" in result or "truncated" in result
-
-    def test_preserves_head_and_tail(self):
-        lines = [f"line {i}" for i in range(50)]
-        big = "\n".join(lines)
-        result = _smart_truncate(big, max_chars=200)
-        assert "line 0" in result
-        assert "line 49" in result
-
-    def test_error_tail_preserved(self):
-        content = "line 1\nline 2\nline 3\n" + "x\n" * 100 + "Traceback (most recent call last):\n  File test.py\nValueError: bad"
-        result = _smart_truncate(content, max_chars=300)
-        assert "Traceback" in result or "ValueError" in result
-
-
-class TestAgeMessage:
-    def test_small_tool_result_unchanged(self):
-        msg = {"role": "tool", "tool_call_id": "1", "content": "short"}
-        assert _age_message(msg) is msg
-
-    def test_large_tool_result_truncated(self):
-        msg = {"role": "tool", "tool_call_id": "1", "content": "x\n" * 1000}
-        result = _age_message(msg)
-        assert len(result["content"]) < len(msg["content"])
-
-    def test_user_message_unchanged(self):
-        msg = {"role": "user", "content": "x" * 2000}
-        assert _age_message(msg) is msg
-
-    def test_anthropic_tool_result_truncated(self):
-        msg = {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "1", "content": "y\n" * 1000}
-        ]}
-        result = _age_message(msg)
-        assert len(result["content"][0]["content"]) < len(msg["content"][0]["content"])
-
-    def test_anthropic_non_tool_block_unchanged(self):
-        msg = {"role": "user", "content": [
-            {"type": "text", "text": "x" * 2000}
-        ]}
-        assert _age_message(msg) is msg
-
-
-class TestAgeToolResults:
-    def test_short_history_unchanged(self):
-        msgs = [{"role": "user", "content": "hi"}]
-        assert _age_tool_results(msgs, keep_recent=10) is msgs
-
-    def test_recent_messages_preserved(self):
-        msgs = [{"role": "system", "content": "sys"}]
-        for i in range(15):
-            msgs.append({"role": "tool", "tool_call_id": str(i), "content": "x\n" * 500})
-        result = _age_tool_results(msgs, keep_recent=5)
-        # Last 5 should be full size
-        assert result[-1]["content"] == msgs[-1]["content"]
-        # Old ones should be truncated
-        assert len(result[1]["content"]) < len(msgs[1]["content"])
-
-    def test_system_messages_never_aged(self):
-        msgs = [
-            {"role": "system", "content": "x" * 2000},
-            {"role": "tool", "tool_call_id": "1", "content": "y\n" * 500},
-        ] + [{"role": "user", "content": "recent"}] * 15
-        result = _age_tool_results(msgs, keep_recent=5)
-        assert result[0]["content"] == msgs[0]["content"]
-
-
-class TestContextPressure:
-    def test_zero_when_no_limit(self):
-        hm = HistoryManager(max_context_tokens=0)
-        assert hm.get_context_pressure() == 0.0
+class TestContextPressureV3:
+    """V3: pressure uses 64K working window."""
 
     def test_low_pressure(self):
-        hm = HistoryManager(max_context_tokens=100000)
+        hm = HistoryManager(max_context_tokens=200000)
         hm.append({"role": "system", "content": "sys"})
-        hm.append({"role": "user", "content": "hi"})
+        hm.append({"role": "user", "content": "short message"})
         pressure = hm.get_context_pressure()
         assert 0.0 < pressure < 0.1
 
     def test_high_pressure(self):
-        hm = HistoryManager(max_context_tokens=100)
+        hm = HistoryManager(max_context_tokens=200000)
         hm.append({"role": "system", "content": "sys"})
-        hm.append({"role": "user", "content": "x" * 2000})
+        # working_window = 200000 * 0.6 = 120000 tokens
+        # Need > 0.7 * 120000 = 84000 estimated tokens
+        # ASCII estimate: len / 4, so need > 336000 chars
+        hm.append({"role": "user", "content": "x" * 400000})
         pressure = hm.get_context_pressure()
-        assert pressure > 1.0
+        assert pressure > 0.7
 
     def test_actual_tokens_used_when_higher(self):
-        hm = HistoryManager(max_context_tokens=1000)
+        hm = HistoryManager(max_context_tokens=200000)
         hm.append({"role": "user", "content": "hi"})
-        hm.report_actual_tokens(800)
+        # working_window = 120000 tokens
+        # Need >= 0.7 * 120000 = 84000 actual tokens
+        hm.report_actual_tokens(90000)
         pressure = hm.get_context_pressure()
-        assert pressure >= 0.8
+        assert pressure >= 0.7
 
 
-class TestForceCompact:
-    def test_no_compaction_when_under_target(self):
-        hm = HistoryManager(max_context_tokens=100000)
+class TestGetMessagesV3:
+    """V3: get_messages returns messages unchanged (no aging/compaction)."""
+
+    def test_no_aging(self):
+        hm = HistoryManager(max_context_tokens=100)
         hm.append({"role": "system", "content": "sys"})
+        hm.append({"role": "user", "content": "x" * 5000})
+        msgs = hm.get_messages()
+        assert not hm.compaction_happened
+        assert any("x" * 100 in m.get("content", "") for m in msgs)
+
+    def test_preserves_all_content(self):
+        hm = HistoryManager(max_context_tokens=50)
+        hm.append({"role": "system", "content": "s"})
+        hm.append({"role": "assistant", "tool_calls": [{"id": "1", "name": "shell"}], "content": ""})
+        hm.append({"role": "tool", "tool_call_id": "1", "content": "x" * 5000})
         hm.append({"role": "user", "content": "hi"})
-        assert hm.force_compact(target_ratio=0.50) is False
-
-    def test_compaction_reduces_tokens(self):
-        hm = HistoryManager(max_context_tokens=500)
-        hm.append({"role": "system", "content": "sys"})
-        for i in range(10):
-            hm.append({"role": "assistant", "tool_calls": [{"id": str(i), "name": "shell"}], "content": ""})
-            hm.append({"role": "tool", "tool_call_id": str(i), "content": "x" * 2000})
-        hm.append({"role": "user", "content": "recent"})
-        before = sum(_message_tokens(m) for m in hm._messages)
-        result = hm.force_compact(target_ratio=0.50)
-        assert result is True
-        after = sum(_message_tokens(m) for m in hm._messages)
-        assert after < before
-
-    def test_force_compact_preserves_recent(self):
-        hm = HistoryManager(max_context_tokens=500)
-        hm.append({"role": "system", "content": "sys"})
-        for i in range(10):
-            hm.append({"role": "assistant", "tool_calls": [{"id": str(i), "name": "shell"}], "content": ""})
-            hm.append({"role": "tool", "tool_call_id": str(i), "content": "x" * 2000})
-        hm.append({"role": "user", "content": "keep this"})
-        hm.force_compact(target_ratio=0.50)
-        msgs = hm._messages
-        assert any(m.get("content") == "keep this" for m in msgs)
+        msgs = hm.get_messages()
+        assert any(m.get("role") == "tool" and "xxxxx" in m.get("content", "") for m in msgs)

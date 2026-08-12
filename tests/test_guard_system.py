@@ -17,12 +17,6 @@ import pytest
 from unittest.mock import MagicMock
 
 from flagscale_agent.react.guard import GuardContext, GuardVerdict
-from flagscale_agent.react.guard.training_attempt import TrainingAttemptGuard
-from flagscale_agent.react.guard.experiment_tracking import ExperimentTrackingGuard
-from flagscale_agent.react.guard.output_dir_reuse import OutputDirReuseGuard
-from flagscale_agent.react.guard.debug_discipline import DebugDisciplineGuard
-from flagscale_agent.react.guard.file_tool import FileToolGuard
-from flagscale_agent.react.guard.megatron_path import MegatronPathGuard
 from flagscale_agent.react.guard.memory_discipline import MemoryDisciplineGuard
 
 
@@ -38,267 +32,236 @@ def make_ctx(tool_name="", tool_args=None, tool_result=""):
     return ctx
 
 
-class TestTrainingAttemptGuard:
-    """Test the 2-Strike rule at attempt granularity."""
 
-    def test_initial_state_no_block(self):
-        guard = TrainingAttemptGuard()
-        ctx = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        result = guard.check_pre(ctx)
-        assert result is None  # No block on first launch
-
-    def test_two_same_category_failures_block(self):
-        guard = TrainingAttemptGuard()
-
-        # First attempt: edit + launch + fail with AttributeError
-        ctx_edit = make_ctx("edit_file", {"path": "model.py", "new_string": "fix"})
-        guard.check_post(ctx_edit)
-
-        ctx_launch = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        guard.check_post(ctx_launch)
-
-        ctx_fail = make_ctx("monitor", {"output_dir": "/tmp/test"},
-                           tool_result="TRAINING CRASHED\nAttributeError: 'X' has no attribute 'y'")
-        guard.check_post(ctx_fail)
-
-        # Second attempt: edit + launch + fail with same category
-        ctx_edit2 = make_ctx("edit_file", {"path": "model.py", "new_string": "fix2"})
-        guard.check_post(ctx_edit2)
-
-        ctx_launch2 = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        guard.check_post(ctx_launch2)
-
-        ctx_fail2 = make_ctx("monitor", {"output_dir": "/tmp/test"},
-                            tool_result="TRAINING CRASHED\nAttributeError: 'Z' has no attribute 'w'")
-        guard.check_post(ctx_fail2)
-
-        # Now trying to launch again should be BLOCKED
-        ctx_launch3 = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        result = guard.check_pre(ctx_launch3)
-        assert result is not None
-        assert result.action == "block"
-
-    def test_different_categories_no_block(self):
-        guard = TrainingAttemptGuard()
-
-        # First attempt: fail with AttributeError
-        ctx_launch = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        guard.check_post(ctx_launch)
-        ctx_fail = make_ctx("monitor", tool_result="TRAINING CRASHED\nAttributeError: missing")
-        guard.check_post(ctx_fail)
-
-        # Second attempt: fail with shape error (different category)
-        ctx_edit = make_ctx("edit_file", {"path": "model.py", "new_string": "x"})
-        guard.check_post(ctx_edit)
-        ctx_launch2 = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        guard.check_post(ctx_launch2)
-        ctx_fail2 = make_ctx("monitor", tool_result="TRAINING CRASHED\nRuntimeError: mat1 size mismatch")
-        guard.check_post(ctx_fail2)
-
-        # Should NOT be blocked (different categories)
-        ctx_launch3 = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        result = guard.check_pre(ctx_launch3)
-        assert result is None
-
-    def test_source_reading_unblocks(self):
-        guard = TrainingAttemptGuard()
-        guard._is_blocked = True
-        guard._blocked_category = "attribute"
-        guard._source_reads_since_block = 0
-
-        # Reading source files should count toward unblock
-        for i in range(3):
-            ctx = make_ctx("read_file", {"path": f"/src/model_{i}.py"}, tool_result="class Model:...")
-            guard.check_post(ctx)
-
-        assert guard._source_reads_since_block >= 3
-
-        # Also need hypothesis to fully unblock
-        guard._hypothesis_declared = True
-
-        # Now launch should be unblocked
-        ctx_launch = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        result = guard.check_pre(ctx_launch)
-        assert result is None
-
-
-class TestExperimentTrackingGuard:
-    """Test experiment recording enforcement."""
-
-    def test_warns_on_first_unrecorded_launch(self):
-        guard = ExperimentTrackingGuard()
-        ctx = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        result = guard.check_pre(ctx)
-        assert result is not None
-        assert result.action == "inject_msg"
-
-    def test_blocks_after_three_unrecorded(self):
-        guard = ExperimentTrackingGuard()
-        ctx = make_ctx("shell", {"command": "python run.py --config-path conf action=run"})
-        guard.check_pre(ctx)  # warn 1
-        guard._attempt_recorded = False
-        guard.check_pre(ctx)  # warn 2
-        guard._attempt_recorded = False
-        result = guard.check_pre(ctx)  # block 3
-        assert result is not None
-        assert result.action == "block"
-
-    def test_recording_resets_count(self):
-        guard = ExperimentTrackingGuard()
-        guard._unrecorded_launches = 2
-
-        # Record an attempt
-        ctx = make_ctx("workspace_experiment", {"action": "add_attempt", "name": "test"})
-        guard.check_post(ctx)
-
-        assert guard._attempt_recorded is True
-        assert guard._unrecorded_launches == 0
-
-
-class TestDebugDisciplineGuard:
-    """Test hypothesis enforcement."""
-
-    def test_no_warning_without_failure(self):
-        guard = DebugDisciplineGuard()
-        ctx = make_ctx("edit_file", {"path": "model.py", "new_string": "fix"})
-        result = guard.check_pre(ctx)
-        assert result is None
-
-    def test_warns_after_failure_without_hypothesis(self):
-        guard = DebugDisciplineGuard()
-
-        # Observe failure
-        ctx_fail = make_ctx("monitor", tool_result="TRAINING CRASHED\nRuntimeError: bad")
-        guard.check_post(ctx_fail)
-
-        # First edit is fine
-        ctx_edit1 = make_ctx("edit_file", {"path": "model.py", "new_string": "fix1"})
-        guard.check_pre(ctx_edit1)
-
-        # Second edit triggers warning
-        ctx_edit2 = make_ctx("edit_file", {"path": "model.py", "new_string": "fix2"})
-        result = guard.check_pre(ctx_edit2)
-        assert result is not None
-
-    def test_debug_print_reminder(self):
-        guard = DebugDisciplineGuard()
-        ctx = make_ctx("edit_file", {"path": "model.py", "new_string": 'print(f"[DBG] value={x}")'})
-        result = guard.check_post(ctx)
-        assert result is not None  # Should get maximization reminder
-
-
-class TestFileToolGuard:
-    """Test file truncation detection."""
-
-    def test_detects_truncated_content(self):
-        guard = FileToolGuard()
-        # Content with unbalanced brackets (looks truncated)
-        content = "def foo():\n" + "    x = {\n" * 10 + "    'key': 'value',\n" * 200
-        ctx = make_ctx("write_file", {"path": "test.py", "content": content, "mode": "write"})
-        result = guard.check_pre(ctx)
-        # Should detect unbalanced brackets
-        if len(content) > 4000:
-            assert result is not None
-
-    def test_no_warning_for_balanced_content(self):
-        guard = FileToolGuard()
-        content = "x = 1\ny = 2\n" * 400  # Long but balanced
-        ctx = make_ctx("write_file", {"path": "test.py", "content": content, "mode": "write"})
-        result = guard.check_pre(ctx)
-        # Balanced content shouldn't trigger truncation warning
-        assert result is None
-
-
-class TestLLMFallback:
-    """Test that guards fall back to LLM classify when regex doesn't match."""
-
-    def test_error_classify_falls_through_to_llm(self):
-        """When regex can't classify, try LLM."""
-        guard = TrainingAttemptGuard()
-        # Create a classify_fn that returns a known category
-        def mock_classify(category, context, default=None):
-            if category == "training_error_category":
-                return {"category": "config", "confidence": 0.9}
-            return default
-
-        ctx = make_ctx("monitor", tool_result="TRAINING CRASHED\nSome weird custom error nobody expected")
-        ctx.classify_fn = mock_classify
-
-        # This error doesn't match any regex pattern
-        result = guard._classify_training_error(ctx.tool_result, ctx)
-        assert result == "config"  # LLM said config with high confidence
-
-    def test_error_classify_ignores_low_confidence_llm(self):
-        """LLM results below confidence threshold are ignored."""
-        guard = TrainingAttemptGuard()
-
-        def mock_classify(category, context, default=None):
-            if category == "training_error_category":
-                return {"category": "nccl", "confidence": 0.3}  # Low confidence
-            return default
-
-        ctx = make_ctx("monitor", tool_result="TRAINING CRASHED\nVague error message")
-        ctx.classify_fn = mock_classify
-
-        result = guard._classify_training_error(ctx.tool_result, ctx)
-        assert result == "general"  # Falls back to general
-
-    def test_error_classify_regex_takes_priority(self):
-        """Regex fast-path should win even if LLM would disagree."""
-        guard = TrainingAttemptGuard()
-
-        def mock_classify(category, context, default=None):
-            return {"category": "data", "confidence": 1.0}  # Would return data
-
-        ctx = make_ctx("monitor", tool_result="TRAINING CRASHED\nAttributeError: 'X' has no attr")
-        ctx.classify_fn = mock_classify
-
-        # Regex should catch AttributeError → "attribute"
-        result = guard._classify_training_error(ctx.tool_result, ctx)
-        assert result == "attribute"
-
-    def test_memory_discipline_llm_discovery(self):
-        """Memory discipline detects results in shell output and tracks pending discoveries."""
+    def test_memory_discipline_reminder_threshold(self):
+        """Memory discipline reminds every 10 non-memory tool calls."""
         guard = MemoryDisciplineGuard()
-        guard._memory_list_done = True  # Skip read-discipline checks
 
-        # Shell with measurable results → should add to pending_discoveries
-        ctx = make_ctx("shell", {"command": "python train.py"},
-                      tool_result="Solved: 6/10 tasks, score=14.0, elapsed=24.6s")
-        guard.check_post(ctx)
-        assert len(guard._pending_discoveries) >= 1
-        assert any(cat in ("solve_rate", "metric", "timing") for cat in guard._pending_discoveries)
+        # 9 calls — no reminder
+        for i in range(9):
+            ctx = make_ctx("shell", {"command": f"echo {i}"}, tool_result="ok")
+            result = guard.check_pre(ctx)
+            assert result is None, f"Unexpected reminder on call {i+1}: {result}"
 
-    def test_debug_residue_llm_detection(self):
-        """LLM can detect non-obvious debug prints."""
-        guard = DebugDisciplineGuard()
-        guard._modified_files.add("/tmp/test_debug_llm.py")
+        # 10th call — triggers reminder, counter resets
+        ctx = make_ctx("shell", {"command": "echo 10"}, tool_result="ok")
+        result = guard.check_pre(ctx)
+        assert result is not None
+        assert result.action == "inject"
+        assert "10 tool calls" in result.message
+        assert guard._calls_since_memory == 0  # Reset after firing
 
-        # Write a file with ambiguous print statement
-        import tempfile, os
-        test_file = "/tmp/test_debug_llm.py"
-        with open(test_file, "w") as f:
-            f.write("""\
-import torch
+        # Next 9 calls — no reminder again
+        for i in range(9):
+            ctx = make_ctx("shell", {"command": f"echo {i}"}, tool_result="ok")
+            result = guard.check_pre(ctx)
+            assert result is None
 
-def forward(self, x):
-    out = self.attn(x)
-    print(f"shape after attn: {out.shape}")  # This is debug!
-    return self.mlp(out)
-""")
+        # 20th total call (10th since last reminder) — triggers again
+        ctx = make_ctx("shell", {"command": "echo again"}, tool_result="ok")
+        result = guard.check_pre(ctx)
+        assert result is not None
+        assert result.action == "inject"
 
-        def mock_classify(category, context, default=None):
-            if category == "is_debug_residue":
-                return {"is_residue": True, "reason": "Temporary shape print for debugging"}
-            return default
+        # memory_read resets counter
+        ctx = make_ctx("memory_read", {"key": "test"}, tool_result="value")
+        result = guard.check_pre(ctx)
+        assert result is None
+        assert guard._calls_since_memory == 0
 
-        guard._modified_files = {test_file}
-        residues = guard.check_clean_diff(classify_fn=mock_classify)
-        assert len(residues) >= 1
-        assert "LLM" in residues[0] or "shape after attn" in residues[0]
+    def test_memory_discipline_block_at_30_calls(self):
+        """After 30 non-memory calls, guard blocks (overridable)."""
+        guard = MemoryDisciplineGuard()
 
-        # Cleanup
-        os.unlink(test_file)
+        # First 29 calls — should get injects at 10, 20 but no block
+        for i in range(29):
+            ctx = make_ctx("shell", {"command": "ls"})
+            result = guard.check_pre(ctx)
+            if result:
+                assert result.action == "inject"
+
+        # 30th call → block
+        ctx = make_ctx("shell", {"command": "ls"})
+        result = guard.check_pre(ctx)
+        assert result is not None
+        assert result.action == "block"
+        assert "30" in result.message
+
+    def test_memory_discipline_block_overridable(self):
+        """Block at 30 can be overridden with a reason."""
+        guard = MemoryDisciplineGuard()
+
+        ctx = make_ctx("shell", {"command": "ls"})
+        assert guard.accept_override("No memory needed for this pure refactoring task", ctx)
+        # Counter should reset
+        assert guard._calls_since_memory == 0
+
+    def test_memory_discipline_block_not_overridable_without_reason(self):
+        """Block override rejected if reason is too short."""
+        guard = MemoryDisciplineGuard()
+
+        ctx = make_ctx("shell", {"command": "ls"})
+        assert not guard.accept_override("ok", ctx)
+
+
+
+
+class TestMemoryEvolution:
+    """Tests for memory self-evolution mechanism in MemoryDisciplineGuard."""
+
+    def test_evolution_reminder_on_task_complete_without_review(self):
+        """If agent emits TASK_COMPLETE without any memory_list, remind to review."""
+        guard = MemoryDisciplineGuard()
+
+        # Simulate assistant text with TASK_COMPLETE, no tool call
+        ctx = MagicMock(spec=GuardContext)
+        ctx.tool_name = ""
+        ctx.tool_args = {}
+        ctx.tool_result = ""
+        ctx.assistant_text = "Done. [TASK_COMPLETE]"
+        ctx.classify_fn = None
+
+        result = guard.check_pre(ctx)
+        assert result is not None
+        assert "TASK_COMPLETE" in result.message
+        assert "memory_list" in result.message
+        assert guard._evolution_reminded is True
+
+    def test_no_evolution_reminder_if_memory_reviewed(self):
+        """If agent already did memory_list, no evolution reminder on TASK_COMPLETE."""
+        guard = MemoryDisciplineGuard()
+
+        # Simulate a memory_list call
+        ctx = MagicMock(spec=GuardContext)
+        ctx.tool_name = "memory_list"
+        ctx.tool_args = {}
+        ctx.tool_result = "entries..."
+        ctx.assistant_text = ""
+        ctx.classify_fn = None
+        guard.check_pre(ctx)
+
+        assert guard._has_memory_review is True
+
+        # Now TASK_COMPLETE — no reminder needed
+        ctx2 = MagicMock(spec=GuardContext)
+        ctx2.tool_name = ""
+        ctx2.tool_args = {}
+        ctx2.tool_result = ""
+        ctx2.assistant_text = "All done [TASK_COMPLETE]"
+        ctx2.classify_fn = None
+
+        result = guard.check_pre(ctx2)
+        assert result is None
+
+    def test_evolution_reminder_fires_only_once(self):
+        """Evolution reminder should fire at most once per session."""
+        guard = MemoryDisciplineGuard()
+
+        ctx = MagicMock(spec=GuardContext)
+        ctx.tool_name = ""
+        ctx.tool_args = {}
+        ctx.tool_result = ""
+        ctx.assistant_text = "[TASK_COMPLETE]"
+        ctx.classify_fn = None
+
+        result1 = guard.check_pre(ctx)
+        assert result1 is not None
+
+        # Second time — no reminder
+        result2 = guard.check_pre(ctx)
+        assert result2 is None
+
+    def test_memory_read_also_counts_as_review(self):
+        """memory_read should also mark _has_memory_review."""
+        guard = MemoryDisciplineGuard()
+
+        ctx = MagicMock(spec=GuardContext)
+        ctx.tool_name = "memory_read"
+        ctx.tool_args = {"key": "fact/cluster/ssh_port"}
+        ctx.tool_result = "content..."
+        ctx.assistant_text = ""
+        ctx.classify_fn = None
+        guard.check_pre(ctx)
+
+        assert guard._has_memory_review is True
+
+
+# ── Override Hint Tests ──
+
+class TestOverrideHint:
+    def test_override_hint_format(self):
+        """Override hint should contain _override_reason instruction."""
+        from flagscale_agent.react.guard import _OVERRIDE_HINT
+        assert "_override_reason" in _OVERRIDE_HINT
+        assert "OVERRIDE REQUIRED" in _OVERRIDE_HINT
+
+    def test_hint_added_to_block(self):
+        """Block verdicts get override hint appended by registry."""
+        from flagscale_agent.react.guard import GuardRegistry, Guard, GuardVerdict, GuardContext
+
+        class BlockingGuard(Guard):
+            name = "blocker"
+            def check_pre(self, ctx):
+                return GuardVerdict.block("[Blocked] reason", reason="test", category="test")
+
+        reg = GuardRegistry()
+        reg.register(BlockingGuard())
+        ctx = GuardContext(tool_name="shell", override_reason="")
+        result = reg.check_pre(ctx)
+        assert "_override_reason" in result.message
+        assert "OVERRIDE REQUIRED" in result.message
+
+    def test_hint_not_re_added_after_rejected_override(self):
+        """If override was attempted and rejected, no re-hint."""
+        from flagscale_agent.react.guard import GuardRegistry, Guard, GuardVerdict, GuardContext
+
+        class BlockingGuard(Guard):
+            name = "blocker"
+            def check_pre(self, ctx):
+                return GuardVerdict.block("[Blocked] still wrong", reason="test", category="test")
+            def accept_override(self, reason, ctx):
+                return False  # Always reject
+
+        reg = GuardRegistry()
+        reg.register(BlockingGuard())
+        ctx = GuardContext(tool_name="shell", override_reason="I already tried")
+        result = reg.check_pre(ctx)
+        # Override was attempted but rejected — hint should not be re-added
+        assert "OVERRIDE REQUIRED" not in result.message
+
+    def test_escalate_hint_added(self):
+        """Escalate verdicts get escalate hint telling LLM not to retry."""
+        from flagscale_agent.react.guard import GuardRegistry, Guard, GuardVerdict, GuardContext
+
+        class EscalatingGuard(Guard):
+            name = "escalator"
+            def check_pre(self, ctx):
+                return GuardVerdict.escalate("[Escalated] forbidden", reason="test", category="test")
+
+        reg = GuardRegistry()
+        reg.register(EscalatingGuard())
+        ctx = GuardContext(tool_name="shell", override_reason="")
+        result = reg.check_pre(ctx)
+        assert "ESCALATED" in result.message
+        assert "DO NOT retry" in result.message
+        assert "OVERRIDE REQUIRED" not in result.message
+
+    def test_escalate_cannot_be_overridden(self):
+        """Escalate ignores override_reason."""
+        from flagscale_agent.react.guard import GuardRegistry, Guard, GuardVerdict, GuardContext
+
+        class EscalatingGuard(Guard):
+            name = "escalator"
+            def check_pre(self, ctx):
+                return GuardVerdict.escalate("[Escalated] forbidden", reason="test", category="test")
+
+        reg = GuardRegistry()
+        reg.register(EscalatingGuard())
+        ctx = GuardContext(tool_name="shell", override_reason="I have a good reason")
+        result = reg.check_pre(ctx)
+        # Still escalated — override_reason is ignored
+        assert result is not None
+        assert "ESCALATED" in result.message
 
 
 if __name__ == "__main__":
