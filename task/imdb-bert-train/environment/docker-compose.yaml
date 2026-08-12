@@ -1,0 +1,36 @@
+services:
+  main:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${IMDB_BASE_IMAGE:-local/flagscale-agent-base-rewardkit:cu128-py312}
+
+    image: local/flagscale-imdb-agent-eval:latest
+    working_dir: /app
+    command: ["bash", "-lc", "sleep infinity"]
+
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface/hub
+      TOKENIZERS_PARALLELISM: "false"
+      HTTP_PROXY: http://flagcicd-yzli:A7fK9mQ2Zx4P@114.111.19.82:80
+      HTTPS_PROXY: http://flagcicd-yzli:A7fK9mQ2Zx4P@114.111.19.82:80
+      NO_PROXY: localhost,127.0.0.1,zyapi.xmsxb.com
+
+    volumes:
+      - /root/wlxprojects/FlagScale-Agent:/mnt/flagscale-agent-host:ro
+
+      - /root/wlxprojects/FlagScale-Agent-main/data/imdb/plain_text:/datasets/imdb:ro
+
+      - /root/.cache/huggingface:/root/.cache/huggingface:ro
+
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: 
+                - "1"
+              capabilities: [gpu]
