@@ -73,7 +73,6 @@ class FlagScaleInstalledAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         """Install FlagScale-Agent from host-mounted local source."""
-
         install_script = f"""
 set -Eeuo pipefail
 
