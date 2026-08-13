@@ -19,9 +19,9 @@ services:
       NO_PROXY: localhost,127.0.0.1,zyapi.xmsxb.com
 
     volumes:
-      - /root/wlxprojects/FlagScale-Agent:/mnt/flagscale-agent-host:ro
+      - {FlagScale-Agent Path}:/mnt/flagscale-agent-host:ro
 
-      - /root/wlxprojects/FlagScale-Agent-main/data/imdb/plain_text:/datasets/imdb:ro
+      - {Imdb data Path}:/datasets/imdb:ro
 
       - /root/.cache/huggingface:/root/.cache/huggingface:ro
 
