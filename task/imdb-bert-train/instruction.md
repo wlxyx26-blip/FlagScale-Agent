@@ -13,7 +13,7 @@ train-00000-of-00001.parquet
 test-00000-of-00001.parquet
 unsupervised-00000-of-00001.parquet
 ```
-你必须先自动识别数据格式，并从本地路径 /datasets/imdb 读取数据。
+你必须先自动识别数据格式，并从本地路径 /data/imdb 读取数据。
 不得重新从互联网下载 IMDB 数据集。
 
 你的任务是端到端完成一个英文情感二分类训练任务（IMDB）：
