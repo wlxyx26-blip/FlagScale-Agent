@@ -22,4 +22,4 @@ services:
       NO_PROXY: localhost,127.0.0.1,zyapi.xmsxb.com
     
     volumes:
-      - /root/wlxprojects/FlagScale-Agent:/mnt/flagscale-agent-host:ro
+      - {FlagScale-Agent Path}:/mnt/flagscale-agent-host:ro
