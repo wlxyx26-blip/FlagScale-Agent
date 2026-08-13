@@ -3,7 +3,7 @@
 - pip 与 venv
 - shell 工具
 - 网络访问能力
-
+```
 现有一份 PyTorch 状态字典（路径：/app/weights.pt），存储着 PyTorch 模型权重，另有数据集文件（路径：/app/dataset.pt），包含多组输入 - 输出数据对。
 先给你的任务要求如下：
 任务：
@@ -26,10 +26,10 @@
 - /app/model.pt：最终TorchScript模型。
 
 recovery_metrics.json格式示例：
-
 {
   "baseline_mse": 0.123,
   "tuned_mse": 0.087,
   "epochs": 10,
   "train_sec": 15.6
 }
+```
