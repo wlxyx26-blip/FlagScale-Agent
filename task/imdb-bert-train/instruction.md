@@ -32,7 +32,7 @@ unsupervised-00000-of-00001.parquet
 实验设置：
 训练/验证 = 20000/5000
 测试 = 25000
-
+```
 seed = 42
 max_length = 256
 epochs = 3
@@ -42,7 +42,7 @@ weight decay = 0.01
 warmup ratio = 0.1
 max_grad_norm = 1.0
 optimizer = AdamW；
-
+```
 注意一轮epoch是要完整的跑完整个训练集中所有的数据，之后在计算loss，再接着跑知道设定的epochs
 
 6. 在测试集上推理；
