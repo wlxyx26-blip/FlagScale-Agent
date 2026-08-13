@@ -14,12 +14,12 @@ services:
       - sleep infinity
 
     environment:
-      HF_HOME: /root/.cache/huggingface
-      TRANSFORMERS_CACHE: /root/.cache/huggingface/hub
+       HF_HOME: {HF cache Path} #添加HF cache 路径
+      TRANSFORMERS_CACHE: {HF cache Path}/hub  #添加存储的模型文件缓存位置，降低重复下载
       TOKENIZERS_PARALLELISM: "false"
-      HTTP_PROXY: http://flagcicd-yzli:A7fK9mQ2Zx4P@ {VPN ip}
-      HTTPS_PROXY: http://flagcicd-yzli:A7fK9mQ2Zx4P@ {VPN ip}
-      NO_PROXY: localhost,127.0.0.1,zyapi.xmsxb.com
+      HTTP_PROXY: http://用户名:密码@代理地址:80   #添加VPN
+      HTTPS_PROXY: http://用户名:密码@代理地址:80
+      NO_PROXY: localhost,{本机 ip},{api 访问地址}   #添加容器访问哪些地址要跳过VPN，直接链接，例如：本机ip，模型推理请求的服务访问地址
     
     volumes:
       - {FlagScale-Agent Path}:/mnt/flagscale-agent-host:ro
