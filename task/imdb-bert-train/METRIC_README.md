@@ -15,16 +15,13 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 --consistent：Agent报告结果与Verifier独立复算结果上下浮动最大不超任务预设的数值容差 暂定0.01（0/1）
 --model_quality_pass:预设模型主指标应达到任务预先标定的质量合格线。暂定0.01（0/1）
 
-与第一次运行时得出的主指标结果作为合格线0.9206
-
-#合格线由参考方案多次独立运行的单侧95%预测边界与任务最低有效性能共同确定。
-
+与第一次运行时得出的主指标结果作为合格线0.9211
 不同类型任务的主指标不同，本次训练任务以ACC为主指标
 
 （2）task_quality代表任务质量，判断智能体完成任务的“有多好”，使用连续评分：
 这部分使用LLM-as-judge作为评分机制，主要对轨迹以及agent生成的结果进行评分，将评价项的分数，按照各自的权重做加权平均，得到计算方式如下：
     task_quality = （wp * process + wr * robustness） / (wp + wr)
-其中，当前wp = 1、wr = 1
+其中，当前wp = 0.8、wr = 0.2
 
  --process：执行过程质量-工具选择是否正确，传入参数是否合理，是否错误使用了无关工具，整体执行任务顺序是否合理  （0-100）
 重点评价：
@@ -45,23 +42,13 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 6.文件或者其余不存在，有没有重新确认路径。
 
 
-###后续也可以将token消耗量，工具调用次数等纳入评分规则中，如果消耗过高，将评分拉下  调研，当前要融合大模型判定      
-分析token消耗###
+###后续也可以将token消耗量，工具调用次数等纳入评分规则中###
 
 三、统计资源
 在评估框架中，可以直接提取出运行任务的输入Token，输出Token，缓存Token，工具调用次数，调用工具数，LLM调用次数，LLM总延迟，总体运行时间等
 path：./jobs/<id>/<task name>/agent/usage-summary.json
 
-#这部分当前代码还得需要精细
 
-###eg. 比较统一任务下效率###
-resource_efficiency =
-    0.25 × token_efficiency
-  + 0.25 × llm_call_efficiency
-  + 0.25 × tool_call_efficiency
-  + 0.25 × runtime_efficiency
-
-选取中位Token中位、工具调用次数、中位LLM调用次数、中位运行时间
 
 
 
