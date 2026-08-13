@@ -22,8 +22,8 @@ user = "root"
 timeout_sec = 3600.0
 
 [verifier.env]
-OPENAI_API_KEY = "sk-EaxCea973Gp3iZE7EAtq1atfE2giLXvyOyKu8hsPyScraqXV"
-OPENAI_API_BASE = "https://zyapi.xmsxb.com/v1"
+OPENAI_API_KEY = "your_kpi"
+OPENAI_API_BASE = "kpi_base_url"
 LITELLM_LOCAL_MODEL_COST_MAP = "True"
 
 
