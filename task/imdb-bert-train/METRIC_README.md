@@ -59,19 +59,25 @@ Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
 
     Bi = (Btoken,Bllm,Btool,Bruntime)​
 ​
-对于再次修改之后再次运行的同一任务，得到：​
+对于再次修改之后再次运行的同一任务，得到：
+​
 
-Ai=(Atoken,Allm,Atool,Aruntime)​
+Ai=(Atoken,Allm,Atool,Aruntime)
+​
 
-从而得到效率公式：​
+从而得到效率公式：
+​
 
-Ej=min(1，Bj/Aj)​
+Ej=min(1，Bj/Aj)
+​
 
 这里，j ∈（token、llm、tool、runtime）​
 ​
-则最终Resource Efficiency计算如下：​              
+则最终Resource Efficiency计算如下：​           
+
 
 Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+
 
 其中，wt=wl=wc=wr=0.25​
 
