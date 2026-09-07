@@ -41,12 +41,27 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 5. 多轮被被阻断后，最终执行状态是否稳定；
 6.文件或者其余不存在，有没有重新确认路径。
 
-
-###后续也可以将token消耗量，工具调用次数等纳入评分规则中###
-
-三、统计资源
-在评估框架中，可以直接提取出运行任务的输入Token，输出Token，缓存Token，工具调用次数，调用工具数，LLM调用次数，LLM总延迟，总体运行时间等
+（3）Resource Efficiency：计算资源效率
+在评估框架中，可以直接提取出运行任务的输入Token，输出Token，缓存Token，工具调用次数，LLM调用次数，总体运行时间等
 path：./jobs/<id>/<task name>/agent/usage-summary.json
+
+对于一个任务，使用baseline agent运行N次，（至少N大于5），得到：​                 
+ R1、R2、R3...
+其中，Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
+取其中位数作为该任务的基础版本预算：​               
+Bi = median（R1,R2,R3...）​
+得到：​              
+Bi=(Btoken,Bllm,Btool,Bruntime)​
+​
+对于再次修改之后再次运行的同一任务，得到：​
+Ai=(Atoken,Allm,Atool,Aruntime)​
+从而得到效率公式：​
+Ej=min(1，Bj/Aj)​
+这里，j ∈（token、llm、tool、runtime）​
+​
+则最终Resource Efficiency计算如下：​              
+Resource Efficiency=100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+其中，wt=wl=wc=wr=0.25​
 
 
 
