@@ -50,11 +50,13 @@ path：./jobs/<id>/<task name>/agent/usage-summary.json
 其中，Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
 取其中位数作为该任务的基础版本预算：​               
 Bi = median（R1,R2,R3...）​
+
 得到：​              
 Bi=(Btoken,Bllm,Btool,Bruntime)​
 ​
 对于再次修改之后再次运行的同一任务，得到：​
 Ai=(Atoken,Allm,Atool,Aruntime)​
+
 从而得到效率公式：​
 Ej=min(1，Bj/Aj)​
 这里，j ∈（token、llm、tool、runtime）​
