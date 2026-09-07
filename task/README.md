@@ -7,13 +7,13 @@
 - 最终任务正确性；
 - 任务产物质量：工具使用和执行过程质量和异常识别与恢复能力。
 
-FlagScale-Agent 执行过程中生成原生 JSONL trace，Harbor Adapter 会在任务结束后将其转换为 ATIF-v1.7，供 LLM-as-Judge 进行过程质量评测。
+FlagScale-Agent 执行过程中生成原生 JSONL trace，Harbor Adapter 会在agent结束后将其转换为 ATIF-v1.7，供 LLM-as-Judge 进行过程质量评测。
 
 ### 前置条件
 - **系统：** Linux
-- **硬件：** GPU/CPU
+- **硬件：** GPU
 
-> **运行说明：** 建议在本地运行时，将 `FlagScale-Agent` 源码（除去`task`外的代码文件）与 本仓库中`task` 任务放在不同文件夹中。例如：
+> **运行说明：** 建议在本地运行时，将 `FlagScale-Agent` 源码（除去`task`外的代码文件）与 本仓库中`task` 任务放在不同文件夹中。示例如下：
 
 ```text
 Test/
@@ -24,7 +24,7 @@ Test/
 │   ├── imdb-bert-train/
 │   └── ...
 ```
-> **代码说明：** 相较于官方FlagScale-Agent代码仓库，本仓库中针对FlagScale-Agent源码修改了flagscale_agent/react/agent.py、FlagScale-Agent/flagscale_agent/react/providers/anthropic_provider.py文件，并添加FlagScale-Agent/flagscale_agent/trace_logger.py文件，获取FlagScale-Agent的原生轨迹文件，以便后续生成harbor框架接受的用于LLM-As-Judeg判断的ATIF轨迹文件
+> **代码说明：** 相较于官方FlagScale-Agent代码仓库，本仓库中针对FlagScale-Agent源码修改了flagscale_agent/react/agent.py、FlagScale-Agent/flagscale_agent/react/providers/anthropic_provider.py文件，并添加FlagScale-Agent/flagscale_agent/trace_logger.py文件，获取FlagScale-Agent的原生结构化轨迹文件，以便后续生成harbor框架接受的用于LLM-As-Judeg判断的ATIF轨迹文件
 
 ### 1. 安装 Harbor
 
