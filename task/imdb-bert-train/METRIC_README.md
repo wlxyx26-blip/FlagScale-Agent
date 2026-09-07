@@ -52,11 +52,13 @@ path：./jobs/<id>/<task name>/agent/usage-summary.json
 
 其中，
 
-Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
+
+    Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
+
 
 取其中位数作为该任务的基础版本预算：​               
 
-    Bi = median（R1,R2,R3...）​
+   Bi = median（R1,R2,R3...）​
 
 得到：​  
 
