@@ -77,9 +77,7 @@ path：./jobs/<id>/<task name>/agent/usage-summary.json
 ​
 则最终Resource Efficiency计算如下：​        
 
-
-  Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
-
+   Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
 
 其中，wt=wl=wc=wr=0.25​
 
