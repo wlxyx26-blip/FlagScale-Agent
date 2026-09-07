@@ -58,7 +58,7 @@ harbor --version
 Harbor 支持集成用户自定义的 Agent 程序，当前仓库已完成 `FlagScale-Agent` 与 Harbor 的自定义接口适配，`task/harbor_adapter/flagscale_agent_adapter`
 
 ### 3.测评任务
-运行时，任务文件需要修改成本地路径以及相其他关内容。
+运行时，任务文件需要修改成本地路径以及相关配置。
 
 ### imdb-bert-train
 
@@ -97,37 +97,15 @@ ANTHROPIC_BASE_URL = "kpi_base_url"
 [judge]
 judge = "model name"
 ```
-
-### pytorch-model-recovery
-
-修改`pytorch-model-recovery/environment/docker-compose.yaml`文件
-```bash
-volumes:
-      - {FlagScale-Agent Path}:/mnt/flagscale-agent-host:ro  #添加agent源码所在路径
-
-environment:
-      HF_HOME: {HF cache Path} #添加HF cache 路径
-      TRANSFORMERS_CACHE: {HF cache Path}/hub  #添加存储的模型文件缓存位置，降低重复下载
-      TOKENIZERS_PARALLELISM: "false"
-      HTTP_PROXY: http://用户名:密码@代理地址:80   #添加VPN
-      HTTPS_PROXY: http://用户名:密码@代理地址:80
-      NO_PROXY: localhost,{本机 ip},{api 访问地址}   #添加容器访问哪些地址要跳过VPN，直接链接，例如：本机ip，模型推理请求的服务访问地址
-```
-
 ### 4.准备镜像
-### local/flagscale-agent-base:cu128-py312
+创建基础镜像
+### local/flagscale-agent-base-rewardkit:cu128-py312
+单独创建Dockerfile.rewardkit-base文件,编写下面内容:
 ```bash
-在命令行输入：
 docker pull harbor.baai.ac.cn/flagscale/flagscale-train:dev-cu128-py3.12-20260319182856
-
 IMAGE="harbor.baai.ac.cn/flagscale/flagscale-train:dev-cu128-py3.12-20260319182856"
 LOCAL_IMAGE="local/flagscale-agent-base:cu128-py312"
-
 docker tag "$IMAGE" "$LOCAL_IMAGE"
-```
-### local/flagscale-agent-base-rewardkit:cu128-py312
-```bash
-单独创建Dockerfile.rewardkit-base文件,编写下面内容:
 FROM local/flagscale-agent-base:cu128-py312
 RUN python3 -m venv /opt/rewardkit-env && \
     /opt/rewardkit-env/bin/python -m pip install --no-cache-dir \
@@ -139,7 +117,6 @@ docker build \
   -f Dockerfile.rewardkit-base \
   -t local/flagscale-agent-base-rewardkit:cu128-py312 .
 ```
-> 成功创建可以LLM-as-judge环境的公共镜像，如imdb-bert-train
 
 ### 4.运行
 使用命令：
