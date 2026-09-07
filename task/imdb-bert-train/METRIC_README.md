@@ -46,23 +46,31 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 path：./jobs/<id>/<task name>/agent/usage-summary.json
 
 对于一个任务，使用baseline agent运行N次，（至少N大于5），得到：​                 
- R1、R2、R3...
+    R1、R2、R3...
+
 其中，Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
+
 取其中位数作为该任务的基础版本预算：​               
-Bi = median（R1,R2,R3...）​
+
+    Bi = median（R1,R2,R3...）​
 
 得到：​              
-Bi=(Btoken,Bllm,Btool,Bruntime)​
+    Bi = (Btoken,Bllm,Btool,Bruntime)​
 ​
 对于再次修改之后再次运行的同一任务，得到：​
+
 Ai=(Atoken,Allm,Atool,Aruntime)​
 
 从而得到效率公式：​
+
 Ej=min(1，Bj/Aj)​
+
 这里，j ∈（token、llm、tool、runtime）​
 ​
 则最终Resource Efficiency计算如下：​              
-Resource Efficiency=100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+
+Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+
 其中，wt=wl=wc=wr=0.25​
 
 
