@@ -45,16 +45,18 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 在评估框架中，可以直接提取出运行任务的输入Token，输出Token，缓存Token，工具调用次数，LLM调用次数，总体运行时间等
 path：./jobs/<id>/<task name>/agent/usage-summary.json
 
-对于一个任务，使用baseline agent运行N次，（至少N大于5），得到：​                 
-    R1、R2、R3...
+对于一个任务，使用baseline agent运行N次，（至少N大于5），得到：​R1、R2、R3...
 
-其中，Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
+其中，
+
+Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
 
 取其中位数作为该任务的基础版本预算：​               
 
     Bi = median（R1,R2,R3...）​
 
-得到：​              
+得到：​  
+
     Bi = (Btoken,Bllm,Btool,Bruntime)​
 ​
 对于再次修改之后再次运行的同一任务，得到：​
