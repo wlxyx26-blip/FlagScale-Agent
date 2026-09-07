@@ -70,9 +70,11 @@ Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
 ​
 这里，j ∈（token、llm、tool、runtime）​
 ​
-则最终Resource Efficiency计算如下：​           
+则最终Resource Efficiency计算如下：​        
 
-  Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+
+  RE = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+
 
 其中，wt=wl=wc=wr=0.25​
 
