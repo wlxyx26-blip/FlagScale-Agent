@@ -28,7 +28,7 @@ Test/
 
 ### 1. 安装 Harbor
 
-首先安装 `pipx`：
+安装 `pipx`：
 
 ```bash
 apt install -y pipx
@@ -39,8 +39,6 @@ apt install -y pipx
 ```bash
 pipx install harbor --pip-args="-i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 300"
 ```
-
-> 建议使用清华 PyPI 镜像，以提高下载速度。
 
 将 `pipx` 安装路径添加到 `PATH`：
 
