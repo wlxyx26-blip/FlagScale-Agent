@@ -1,13 +1,14 @@
 
 ###评测FlagScale-Agent 端到端训练测试任务###
 
-任务得分;
-    task_score = task_success × task_quality
+任务得分：
+
+    task_score = task_success × （0.7 × task_quality ＋ 0.3 × Resource Efficiency）
 
 其中，
 （1）task_score代表任务完成度，判断智能体能否完成任务，最终综合得分为1；否则为0：
 
-task_success =  artifact_score and protocol_score and model_loadable and consistent and modei_quality_pass
+    task_success =  artifact_score and protocol_score and model_loadable and consistent and modei_quality_pass
 
 --artifact_score: 要求生成的文件是否真实存在(0/1)  
 --protocol_score: agent训练参数是否与符合要求(0/1) 
@@ -20,7 +21,9 @@ task_success =  artifact_score and protocol_score and model_loadable and consist
 
 （2）task_quality代表任务质量，判断智能体完成任务的“有多好”，使用连续评分：
 这部分使用LLM-as-judge作为评分机制，主要对轨迹以及agent生成的结果进行评分，将评价项的分数，按照各自的权重做加权平均，得到计算方式如下：
+
     task_quality = （wp * process + wr * robustness） / (wp + wr)
+    
 其中，当前wp = 0.8、wr = 0.2
 
  --process：执行过程质量-工具选择是否正确，传入参数是否合理，是否错误使用了无关工具，整体执行任务顺序是否合理  （0-100）
@@ -73,7 +76,7 @@ Ri（Tokeni,LLMCalli,ToolCalli,Runtimei）​
 则最终Resource Efficiency计算如下：​        
 
 
-  RE = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
+  Resource Efficiency = 100 × （wt*E token+wl*E llm+wc*E tool+wr*E runtime）​
 
 
 其中，wt=wl=wc=wr=0.25​
