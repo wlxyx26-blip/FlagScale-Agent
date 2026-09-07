@@ -74,7 +74,7 @@ volumes:
       TOKENIZERS_PARALLELISM: "false"
       HTTP_PROXY: http://用户名:密码@代理地址:80   #添加本地VPN
       HTTPS_PROXY: http://用户名:密码@代理地址:80
-      NO_PROXY: localhost,{本机 ip},{api 访问地址}   #添加容器访问哪些地址要跳过VPN，直接链接，例如：本机ip，模型推理请求的服务访问地址，以免报错
+      NO_PROXY: localhost,{本机 ip},{api 访问地址}   #添加容器访问哪些地址要跳过VPN，直接链接，例如：本机ip，模型推理请求的服务访问地址，以免因网络报错
 
 device_ids:
   - "${IMDB_GPU_DEVICE_ID}"   #当前任务声明task.toml是需要1张GPU,这里是声明使用gpu标号，不需要可删除
