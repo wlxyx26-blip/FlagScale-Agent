@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import json
 import os
@@ -73,6 +72,7 @@ class FlagScaleInstalledAgent(BaseInstalledAgent):
 
     async def install(self, environment: BaseEnvironment) -> None:
         """Install FlagScale-Agent from host-mounted local source."""
+
         install_script = f"""
 set -Eeuo pipefail
 
@@ -683,4 +683,2074 @@ exit "${{AGENT_STATUS}}"
             ),
             "llm_call_count": llm_call_count,
             "total_llm_latency_sec": (
-                round(total_llm_latency_
+                round(total_llm_latency_sec, 6)
+                if total_llm_latency_sec > 0
+                else None
+            ),
+            "average_llm_latency_sec": (
+                round(
+                    total_llm_latency_sec / llm_call_count,
+                    6,
+                )
+                if llm_call_count and total_llm_latency_sec > 0
+                else None
+            ),
+            "tool_call_count": len(tool_call_ids),
+            "tool_result_count": len(tool_result_ids),
+            "tool_error_count": tool_error_count,
+            "unique_tool_count": len(tool_counts),
+            "tool_counts": dict(tool_counts),
+            "tool_status_counts": dict(tool_status_counts),
+            "tool_execution_duration_sec": (
+                round(tool_execution_duration_sec, 6)
+                if tool_execution_duration_sec > 0
+                else None
+            ),
+            "agent_runtime_sec": (
+                round(agent_runtime_sec, 6)
+                if agent_runtime_sec is not None
+                else None
+            ),
+            "runtime_source": "native_event_timestamp_span",
+            "event_count": event_count,
+            "models": sorted(models),
+            "usage_source": "flagscale-events.jsonl",
+            "usage_is_exact": token_usage_available,
+            "native_tool_metrics_exact": True,
+            "native_token_usage_available": token_usage_available,
+        }
+
+
+    def _read_atif(self, path: Path) -> dict[str, Any]:  #Token,成本，LLM调用次数，工具调用次数，工具错误次数，不同工具数量
+        """Read tokens, cost and tool calls from an ATIF trajectory."""
+        #ATIF → usage.json → 普通日志正则解析
+        
+        trajectory = json.loads(path.read_text(encoding="utf-8"))
+        final_metrics = trajectory.get("final_metrics") or {}
+        steps = trajectory.get("steps") or []
+
+        tool_counts: Counter[str] = Counter()
+        tool_error_count = 0
+        llm_call_count = 0
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+
+            count = step.get("llm_call_count")
+            if isinstance(count, int):
+                llm_call_count += count
+            elif step.get("source") == "agent" and step.get("metrics") is not None:
+                llm_call_count += 1
+
+            for call in step.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                name = str(call.get("function_name") or "unknown")
+                tool_counts[name] += 1
+
+            observation = step.get("observation")
+            if not isinstance(observation, dict):
+                continue
+
+            for result in observation.get("results") or []:
+                if not isinstance(result, dict):
+                    continue
+
+                extra = result.get("extra")
+                if isinstance(extra, dict):
+                    status = str(extra.get("status", "")).lower()
+                    if (
+                        extra.get("is_error") is True
+                        or status in {"error", "failed", "failure"}
+                    ):
+                        tool_error_count += 1
+
+        return {
+            "n_input_tokens": self._as_int(
+                final_metrics,
+                "total_prompt_tokens",
+            ),
+            "n_cache_tokens": self._as_int(
+                final_metrics,
+                "total_cached_tokens",
+            ),
+            "n_output_tokens": self._as_int(
+                final_metrics,
+                "total_completion_tokens",
+            ),
+            "cost_usd": self._as_float(
+                final_metrics,
+                "total_cost_usd",
+            ),
+            "llm_call_count": llm_call_count,
+            "tool_call_count": sum(tool_counts.values()),
+            "tool_error_count": tool_error_count,
+            "unique_tool_count": len(tool_counts),
+            "tool_counts": dict(tool_counts),
+            "agent_runtime_sec": None,
+            "usage_source": "atif",
+            "usage_is_exact": True,
+        }
+
+    def _read_native_usage(self, path: Path) -> dict[str, Any]:
+        """Read a FlagScale-Agent-native structured usage report.
+
+        Recommended usage.json schema:
+
+        {
+          "n_input_tokens": 123456,
+          "n_cache_tokens": 12000,
+          "n_output_tokens": 4567,
+          "cost_usd": 1.2345,
+          "llm_call_count": 20,
+          "tool_call_count": 34,
+          "tool_error_count": 2,
+          "tool_counts": {"shell": 20, "read_file": 8, "write_file": 6}
+        }
+
+        n_input_tokens should include cached tokens, matching Harbor semantics.
+        """
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+        cache_tokens = self._as_int(
+            data,
+            "n_cache_tokens",
+            "cache_tokens",
+            "cached_tokens",
+            "total_cached_tokens",
+        ) or 0
+
+        total_input = self._as_int(
+            data,
+            "n_input_tokens",
+            "total_prompt_tokens",
+        )
+
+        # When only provider-style input_tokens is available, treat it as
+        # non-cached input and add the cache subset.
+        if total_input is None:
+            non_cached_input = self._as_int(
+                data,
+                "input_tokens",
+                "prompt_tokens",
+            )
+            if non_cached_input is not None:
+                total_input = non_cached_input + cache_tokens
+
+        tool_counts_raw = data.get("tool_counts")
+        tool_counts = (
+            {
+                str(name): int(count)
+                for name, count in tool_counts_raw.items()
+                if isinstance(count, (int, float))
+            }
+            if isinstance(tool_counts_raw, dict)
+            else {}
+        )
+
+        tool_call_count = self._as_int(data, "tool_call_count")
+        if tool_call_count is None:
+            tool_call_count = sum(tool_counts.values())
+
+        return {
+            "n_input_tokens": total_input,
+            "n_cache_tokens": cache_tokens,
+            "n_output_tokens": self._as_int(
+                data,
+                "n_output_tokens",
+                "output_tokens",
+                "completion_tokens",
+                "total_completion_tokens",
+            ),
+            "cost_usd": self._as_float(
+                data,
+                "cost_usd",
+                "total_cost_usd",
+            ),
+            "llm_call_count": self._as_int(
+                data,
+                "llm_call_count",
+            ) or 0,
+            "tool_call_count": tool_call_count or 0,
+            "tool_error_count": self._as_int(
+                data,
+                "tool_error_count",
+            ) or 0,
+            "unique_tool_count": len(tool_counts),
+            "tool_counts": tool_counts,
+            "agent_runtime_sec": self._as_float(
+                data,
+                "agent_runtime_sec",
+                "runtime_sec",
+            ),
+            "usage_source": str(
+                data.get("usage_source") or "flagscale-native-usage-json"
+            ),
+            "usage_is_exact": bool(data.get("usage_is_exact", True)),
+        }
+
+    def _read_log_fallback(self, path: Path) -> dict[str, Any]:
+        """Approximate metrics from FlagScale-Agent's human-readable log."""
+
+        raw_text = path.read_text(encoding="utf-8", errors="replace")
+        text = self._ANSI_RE.sub("", raw_text)
+
+        summaries = self._TURN_SUMMARY_RE.findall(text)
+
+        n_input_tokens: int | None = None
+        n_output_tokens: int | None = None
+        agent_runtime_sec: float | None = None
+
+        if summaries:
+            _, runtime_text, input_text, output_text = summaries[-1]
+            agent_runtime_sec = float(runtime_text)
+            n_input_tokens = self._parse_compact_int(input_text)
+            n_output_tokens = self._parse_compact_int(output_text)
+
+        tool_names = self._TOOL_RE.findall(text)
+        tool_counts = Counter(tool_names)
+
+        error_patterns = (
+            r"\[Error detected:",
+            r"Constraint VIOLATED",
+            r"\bTraceback\b",
+            r"\bCommand failed\b",
+            r"\s✖\s",
+        )
+
+        tool_error_count = sum(
+            len(re.findall(pattern, text, flags=re.IGNORECASE))
+            for pattern in error_patterns
+        )
+
+        turn_numbers = {
+            int(turn_number)
+            for turn_number, _, _, _ in summaries
+        }
+
+        return {
+            "n_input_tokens": n_input_tokens,
+            "n_cache_tokens": 0 if n_input_tokens is not None else None,
+            "n_output_tokens": n_output_tokens,
+            "cost_usd": None,
+            "llm_call_count": len(turn_numbers),
+            "tool_call_count": len(tool_names),
+            "tool_error_count": tool_error_count,
+            "unique_tool_count": len(tool_counts),
+            "tool_counts": dict(tool_counts),
+            "agent_runtime_sec": agent_runtime_sec,
+            "usage_source": "flagscale-log-fallback",
+            "usage_is_exact": False,
+        }
+
+    def _get_optional_price(self, name: str) -> float | None:
+        """Read an optional --ae pricing variable."""
+
+        raw_value: str | None = None
+
+        getter = getattr(self, "_get_env", None)
+        if callable(getter):
+            raw_value = getter(name)
+
+        if raw_value is None:
+            raw_value = os.environ.get(name)
+
+        if raw_value in (None, ""):
+            return None
+
+        try:
+            value = float(raw_value)
+        except ValueError:
+            return None
+
+        return value if value >= 0 else None
+
+    def _estimate_cost_if_configured(
+        self,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Estimate cost only when explicit per-million prices were supplied."""
+
+        if usage.get("cost_usd") is not None:
+            usage["cost_source"] = "provider_or_agent"
+            return usage
+
+        input_price = self._get_optional_price(
+            "FLAGSCALE_INPUT_PRICE_PER_MILLION_USD"
+        )
+        cache_price = self._get_optional_price(
+            "FLAGSCALE_CACHE_PRICE_PER_MILLION_USD"
+        )
+        output_price = self._get_optional_price(
+            "FLAGSCALE_OUTPUT_PRICE_PER_MILLION_USD"
+        )
+
+        n_input = usage.get("n_input_tokens")
+        n_cache = usage.get("n_cache_tokens")
+        n_output = usage.get("n_output_tokens")
+
+        if (
+            input_price is None
+            or output_price is None
+            or n_input is None
+            or n_output is None
+        ):
+            usage["cost_source"] = "unavailable"
+            return usage
+
+        cache_tokens = int(n_cache or 0)
+        non_cached_input = max(int(n_input) - cache_tokens, 0)
+
+        if cache_tokens > 0 and cache_price is None:
+            usage["cost_source"] = "unavailable_missing_cache_price"
+            return usage
+
+        cost = (
+            non_cached_input / 1_000_000 * input_price
+            + cache_tokens / 1_000_000 * float(cache_price or 0.0)
+            + int(n_output) / 1_000_000 * output_price
+        )
+
+        usage["cost_usd"] = cost
+        usage["cost_source"] = "estimated_from_explicit_prices"
+        return usage
+
+    def _collect_usage(self) -> dict[str, Any]:
+        """Collect Harbor AgentContext usage with structured traces first.
+
+        Priority:
+        1. native JSONL events for exact tool/LLM-call structure
+        2. ATIF/native usage JSON when native event token usage exists there
+        3. human-readable log only to fill token/runtime fields that the new
+           kernel-callback trace does not currently expose
+
+        Tool counts/statuses from structured native events are never replaced
+        by regex-derived log estimates.
+        """
+
+        events_path = self._find_log_file(
+            "flagscale-events.jsonl"
+        )
+        trajectory_path = self._find_log_file(
+            "trajectory.json"
+        )
+        usage_path = self._find_log_file("usage.json")
+        log_path = self._find_log_file(
+            "flagscale-agent.log"
+        )
+
+        try:
+            if events_path is not None:
+                usage = self._read_native_events_usage(
+                    events_path
+                )
+
+                # New assistant_response/tool_call/tool_result traces are exact
+                # for behavior, but currently do not include token usage.
+                # Fill only missing token/runtime fields from the console log;
+                # keep native structured tool metrics untouched.
+                if (
+                    usage.get("n_input_tokens") is None
+                    or usage.get("n_output_tokens") is None
+                ) and log_path is not None:
+                    fallback = self._read_log_fallback(
+                        log_path
+                    )
+                    filled_from_log = False
+
+                    for key in (
+                        "n_input_tokens",
+                        "n_cache_tokens",
+                        "n_output_tokens",
+                        "agent_runtime_sec",
+                    ):
+                        if (
+                            usage.get(key) is None
+                            and fallback.get(key) is not None
+                        ):
+                            usage[key] = fallback.get(key)
+                            filled_from_log = True
+
+                    if filled_from_log:
+                        usage["usage_source"] = (
+                            "flagscale-events.jsonl"
+                            "+flagscale-log-token-fallback"
+                        )
+                        usage["usage_is_exact"] = False
+                        usage["token_usage_fallback"] = (
+                            "human-readable-turn-summary"
+                        )
+
+            elif trajectory_path is not None:
+                usage = self._read_atif(trajectory_path)
+            elif usage_path is not None:
+                usage = self._read_native_usage(usage_path)
+            elif log_path is not None:
+                usage = self._read_log_fallback(log_path)
+            else:
+                usage = {
+                    "n_input_tokens": None,
+                    "n_cache_tokens": None,
+                    "n_output_tokens": None,
+                    "cost_usd": None,
+                    "llm_call_count": 0,
+                    "total_llm_latency_sec": None,
+                    "tool_call_count": 0,
+                    "tool_result_count": 0,
+                    "tool_error_count": 0,
+                    "unique_tool_count": 0,
+                    "tool_counts": {},
+                    "tool_status_counts": {},
+                    "tool_execution_duration_sec": None,
+                    "agent_runtime_sec": None,
+                    "usage_source": "unavailable",
+                    "usage_is_exact": False,
+                }
+        except Exception as exc:
+            usage = {
+                "n_input_tokens": None,
+                "n_cache_tokens": None,
+                "n_output_tokens": None,
+                "cost_usd": None,
+                "llm_call_count": 0,
+                "total_llm_latency_sec": None,
+                "tool_call_count": 0,
+                "tool_result_count": 0,
+                "tool_error_count": 0,
+                "unique_tool_count": 0,
+                "tool_counts": {},
+                "tool_status_counts": {},
+                "tool_execution_duration_sec": None,
+                "agent_runtime_sec": None,
+                "usage_source": "parse-error",
+                "usage_is_exact": False,
+                "usage_parse_error": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
+        usage = self._estimate_cost_if_configured(
+            usage
+        )
+
+        if usage.get("total_tokens") is None:
+            n_input = usage.get("n_input_tokens")
+            n_output = usage.get("n_output_tokens")
+            usage["total_tokens"] = (
+                int(n_input) + int(n_output)
+                if n_input is not None
+                and n_output is not None
+                else None
+            )
+
+        tool_call_count = int(
+            usage.get("tool_call_count") or 0
+        )
+        tool_error_count = int(
+            usage.get("tool_error_count") or 0
+        )
+
+        usage["tool_success_ratio"] = (
+            max(
+                0.0,
+                1.0
+                - tool_error_count / tool_call_count,
+            )
+            if tool_call_count
+            else None
+        )
+
+        return usage
+
+
+    def _populate_context_from_logs(   
+        self,
+        context: AgentContext,
+    ) -> None:
+        
+        usage = self._collect_usage()
+
+        context.n_input_tokens = usage.get("n_input_tokens")
+        context.n_cache_tokens = usage.get("n_cache_tokens")
+        context.n_output_tokens = usage.get("n_output_tokens")
+        context.cost_usd = usage.get("cost_usd")
+
+        metadata = context.metadata or {}
+        metadata["flagscale_agent"] = {
+            "usage_source": usage.get("usage_source"),
+            "usage_is_exact": usage.get("usage_is_exact"),
+            "cost_source": usage.get("cost_source"),
+            "llm_call_count": usage.get("llm_call_count"),
+            "total_llm_latency_sec": usage.get(
+                "total_llm_latency_sec"
+            ),
+            "average_llm_latency_sec": usage.get(
+                "average_llm_latency_sec"
+            ),
+            "tool_call_count": usage.get("tool_call_count"),
+            "tool_result_count": usage.get("tool_result_count"),
+            "tool_error_count": usage.get("tool_error_count"),
+            "unique_tool_count": usage.get("unique_tool_count"),
+            "tool_success_ratio": usage.get("tool_success_ratio"),
+            "tool_counts": usage.get("tool_counts"),
+            "tool_status_counts": usage.get(
+                "tool_status_counts"
+            ),
+            "tool_execution_duration_sec": usage.get(
+                "tool_execution_duration_sec"
+            ),
+            "agent_runtime_sec": usage.get("agent_runtime_sec"),
+            "total_tokens": usage.get("total_tokens"),
+            "usage_parse_error": usage.get("usage_parse_error"),
+        }
+        context.metadata = metadata
+
+        # Keep a human-auditable copy alongside the agent logs.
+        summary_path = Path(self.logs_dir) / "usage-summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(
+            json.dumps(usage, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+    def _get_model_name(self) -> str | None:
+        getter = getattr(self, "_get_env", None)
+
+        for key in (
+            "FLAGSCALE_MODEL",
+            "ANTHROPIC_MODEL",
+            "OPENAI_MODEL",
+        ):
+            value = None
+
+            if callable(getter):
+                value = getter(key)
+
+            if value in (None, ""):
+                value = os.environ.get(key)
+
+            if value not in (None, ""):
+                return str(value)
+
+        return None
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        """从Anthropic内容块中提取公开文本。"""
+
+        if isinstance(content, str):
+            return content
+
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            if block.get("type") == "text":
+                text = block.get("text")
+
+                if isinstance(text, str) and text:
+                    parts.append(text)
+
+        return "\n\n".join(parts)
+
+
+    @staticmethod
+    def _json_text(value: Any) -> str:
+        """把工具返回值稳定转换为Observation文本。"""
+
+        if value is None:
+            return ""
+
+        if isinstance(value, str):
+            return value
+
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str,
+        )
+
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
+    @staticmethod
+    def _clean_extra(data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in data.items()
+            if value is not None
+        }
+    
+    def _convert_kernel_callback_events_to_atif(
+        self,
+        *,
+        events: list[dict[str, Any]],
+        events_path: Path,
+        trajectory_path: Path,
+        logs_dir: Path,
+    ) -> Path | None:
+        """Convert the new Kernel callback trace events to ATIF-v1.7.
+
+        Expected native event schema:
+        - assistant_response(step_id, turn_id, content, truncated)
+        - tool_call(step_id, turn_id, tool_call_id, function_name, arguments)
+        - tool_result(step_id, turn_id, source_call_id, function_name,
+                      content, extra={status, is_error, skip_reason,
+                      error_message, intended_execution})
+
+        The provider-native tool call id is preserved unchanged:
+        ToolCall.tool_call_id == ObservationResult.source_call_id.
+        """
+
+        assistant_events = [
+            event
+            for event in events
+            if event.get("event_type") == "assistant_response"
+        ]
+        if not assistant_events:
+            return None
+
+        tool_calls_by_step: dict[str, list[dict[str, Any]]] = {}
+        tool_result_by_id: dict[str, dict[str, Any]] = {}
+
+        for event in events:
+            event_type = event.get("event_type")
+
+            if event_type == "tool_call":
+                step_key = str(event.get("step_id") or "")
+                tool_calls_by_step.setdefault(
+                    step_key,
+                    [],
+                ).append(event)
+
+            elif event_type == "tool_result":
+                source_call_id = str(
+                    event.get("source_call_id")
+                    or event.get("tool_call_id")
+                    or ""
+                )
+                if source_call_id:
+                    tool_result_by_id[source_call_id] = event
+
+        steps: list[Step] = []
+        next_step_id = 1
+
+        # New callback tracing intentionally records only observable assistant
+        # output/tool execution. The Harbor instruction is preserved directly
+        # on the adapter so we can still reconstruct the initial user step.
+        instruction = str(
+            getattr(self, "_last_instruction", "") or ""
+        )
+        if instruction:
+            first_timestamp = assistant_events[0].get("timestamp")
+            steps.append(
+                Step(
+                    step_id=next_step_id,
+                    timestamp=first_timestamp,
+                    source="user",
+                    message=instruction,
+                )
+            )
+            next_step_id += 1
+
+        requested_model = self._get_model_name()
+        resolved_models: list[str] = []
+        if requested_model:
+            resolved_models.append(requested_model)
+
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_cached_tokens = 0
+        total_cost_usd = 0.0
+        cost_available = False
+        token_usage_available = False
+        total_llm_latency_sec = 0.0
+
+        llm_call_count = 0
+        tool_call_count = 0
+        tool_error_count = 0
+        missing_tool_results: list[str] = []
+
+        for assistant_event in assistant_events:
+            llm_call_count += 1
+
+            native_step_id = assistant_event.get("step_id")
+            step_key = str(native_step_id or "")
+            call_events = tool_calls_by_step.get(
+                step_key,
+                [],
+            )
+
+            atif_tool_calls: list[ToolCall] = []
+            observation_results: list[
+                ObservationResult
+            ] = []
+
+            for call_event in call_events:
+                tool_call_id = str(
+                    call_event.get("tool_call_id")
+                    or ""
+                )
+                if not tool_call_id:
+                    continue
+
+                tool_name = str(
+                    call_event.get("function_name")
+                    or call_event.get("tool_name")
+                    or "unknown"
+                )
+                arguments = call_event.get("arguments")
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+                tool_call_count += 1
+
+                result_event = tool_result_by_id.get(
+                    tool_call_id
+                )
+                result_extra = (
+                    result_event.get("extra")
+                    if isinstance(result_event, dict)
+                    else {}
+                )
+                if not isinstance(result_extra, dict):
+                    result_extra = {}
+
+                intended_execution = (
+                    result_extra.get("intended_execution")
+                    if result_event is not None
+                    else None
+                )
+
+                call_extra = self._clean_extra(
+                    {
+                        # test_outputs.py reads this from ToolCall.extra.
+                        "intended_execution": intended_execution,
+                        "turn_id": call_event.get("turn_id"),
+                        "native_step_id": native_step_id,
+                        "native_event_id": call_event.get(
+                            "event_id"
+                        ),
+                    }
+                )
+
+                atif_tool_calls.append(
+                    ToolCall(
+                        tool_call_id=tool_call_id,
+                        function_name=tool_name,
+                        arguments=arguments,
+                        extra=call_extra or None,
+                    )
+                )
+
+                if result_event is None:
+                    missing_tool_results.append(
+                        tool_call_id
+                    )
+                    continue
+
+                status = str(
+                    result_extra.get("status")
+                    or result_event.get("status")
+                    or "success"
+                ).lower()
+
+                is_error = bool(
+                    result_extra.get("is_error")
+                    or result_event.get("is_error")
+                ) or status in {
+                    "error",
+                    "failed",
+                    "failure",
+                    "denied",
+                }
+
+                if is_error:
+                    tool_error_count += 1
+
+                result_value = result_event.get("content")
+                if result_value is None:
+                    result_value = result_event.get("result")
+                if result_value is None:
+                    result_value = (
+                        result_extra.get("error_message")
+                        or result_event.get("error_message")
+                    )
+
+                executed = (
+                    intended_execution is not False
+                    and status
+                    not in {
+                        "blocked",
+                        "capped",
+                        "skipped",
+                    }
+                )
+
+                observation_extra = self._clean_extra(
+                    {
+                        # Preserve the native classification exactly enough
+                        # for deterministic trajectory scoring.
+                        "status": status,
+                        "is_error": is_error,
+                        "executed": executed,
+                        "intended_execution":
+                            intended_execution,
+                        "skip_reason":
+                            result_extra.get(
+                                "skip_reason"
+                            ),
+                        "error_message":
+                            result_extra.get(
+                                "error_message"
+                            ),
+                        "duration_sec":
+                            result_extra.get(
+                                "duration_sec"
+                            ),
+                        "turn_id":
+                            result_event.get("turn_id"),
+                        "native_step_id":
+                            result_event.get("step_id"),
+                        "function_name":
+                            result_event.get(
+                                "function_name"
+                            )
+                            or tool_name,
+                        "result_timestamp":
+                            result_event.get(
+                                "timestamp"
+                            ),
+                        "native_event_id":
+                            result_event.get(
+                                "event_id"
+                            ),
+                    }
+                )
+
+                observation_results.append(
+                    ObservationResult(
+                        source_call_id=tool_call_id,
+                        content=self._json_text(
+                            result_value
+                        ),
+                        extra=(
+                            observation_extra or None
+                        ),
+                    )
+                )
+
+            usage = assistant_event.get("usage")
+            if not isinstance(usage, dict):
+                usage = {}
+
+            has_usage = any(
+                key in usage
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "cached_tokens",
+                )
+            )
+
+            prompt_tokens = 0
+            output_tokens = 0
+            cache_read = 0
+            cache_creation = 0
+            uncached_input = 0
+            cost_usd = None
+
+            if has_usage:
+                token_usage_available = True
+
+                if any(
+                    key in usage
+                    for key in (
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                    )
+                ):
+                    uncached_input = self._safe_int(
+                        usage.get("input_tokens")
+                    )
+                    cache_creation = self._safe_int(
+                        usage.get(
+                            "cache_creation_input_tokens"
+                        )
+                    )
+                    cache_read = self._safe_int(
+                        usage.get(
+                            "cache_read_input_tokens"
+                        )
+                    )
+                    output_tokens = self._safe_int(
+                        usage.get("output_tokens")
+                    )
+                    prompt_tokens = (
+                        uncached_input
+                        + cache_creation
+                        + cache_read
+                    )
+                else:
+                    prompt_tokens = self._safe_int(
+                        usage.get("prompt_tokens")
+                    )
+                    cache_read = self._safe_int(
+                        usage.get("cached_tokens")
+                    )
+                    uncached_input = max(
+                        prompt_tokens - cache_read,
+                        0,
+                    )
+                    output_tokens = self._safe_int(
+                        usage.get("completion_tokens")
+                    )
+
+                total_prompt_tokens += prompt_tokens
+                total_completion_tokens += output_tokens
+                total_cached_tokens += cache_read
+
+                cost_usd = usage.get("cost_usd")
+                if isinstance(cost_usd, (int, float)):
+                    total_cost_usd += float(cost_usd)
+                    cost_available = True
+
+            latency_sec = assistant_event.get(
+                "latency_sec"
+            )
+            if isinstance(latency_sec, (int, float)):
+                total_llm_latency_sec += max(
+                    0.0,
+                    float(latency_sec),
+                )
+
+            actual_model = (
+                assistant_event.get("model")
+                or requested_model
+            )
+            if actual_model:
+                model_text = str(actual_model)
+                if model_text not in resolved_models:
+                    resolved_models.append(model_text)
+
+            content = assistant_event.get("content")
+            message = (
+                content
+                if isinstance(content, str)
+                else self._json_text(content)
+            )
+
+            step_extra = self._clean_extra(
+                {
+                    "native_step_id": native_step_id,
+                    "turn_id":
+                        assistant_event.get("turn_id"),
+                    "truncated":
+                        assistant_event.get("truncated"),
+                    "native_event_id":
+                        assistant_event.get("event_id"),
+                    "native_sequence_id":
+                        assistant_event.get("sequence_id"),
+                    "token_usage_available":
+                        has_usage,
+                }
+            )
+
+            # Keep Metrics present for Harbor/ATIF compatibility. When the
+            # current callback trace does not expose usage, zeros are marked
+            # explicitly as unavailable rather than claimed as exact.
+            metrics_extra = {
+                "usage_available": has_usage,
+                "cache_creation_input_tokens":
+                    cache_creation,
+                "uncached_input_tokens":
+                    uncached_input,
+            }
+
+            steps.append(
+                Step(
+                    step_id=next_step_id,
+                    timestamp=assistant_event.get(
+                        "timestamp"
+                    ),
+                    source="agent",
+                    model_name=(
+                        str(actual_model)
+                        if actual_model
+                        else None
+                    ),
+                    message=message,
+                    tool_calls=(
+                        atif_tool_calls or None
+                    ),
+                    observation=(
+                        Observation(
+                            results=observation_results
+                        )
+                        if observation_results
+                        else None
+                    ),
+                    metrics=Metrics(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=output_tokens,
+                        cached_tokens=cache_read,
+                        cost_usd=(
+                            float(cost_usd)
+                            if isinstance(
+                                cost_usd,
+                                (int, float),
+                            )
+                            else None
+                        ),
+                        extra=metrics_extra,
+                    ),
+                    llm_call_count=1,
+                    extra=step_extra or None,
+                )
+            )
+            next_step_id += 1
+
+        if not steps:
+            return None
+
+        session_id = next(
+            (
+                str(event["session_id"])
+                for event in events
+                if event.get("session_id")
+            ),
+            None,
+        )
+
+        agent_model = (
+            resolved_models[0]
+            if resolved_models
+            else requested_model
+        )
+
+        trajectory = Trajectory(
+            schema_version="ATIF-v1.7",
+            session_id=session_id,
+            agent=Agent(
+                name=self.name(),
+                version=self.version() or "unknown",
+                model_name=agent_model,
+                tool_definitions=None,
+                extra={
+                    "requested_model":
+                        requested_model,
+                    "resolved_models":
+                        resolved_models,
+                    "native_trace_schema":
+                        "kernel-callback-v2",
+                },
+            ),
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=(
+                    total_prompt_tokens
+                ),
+                total_completion_tokens=(
+                    total_completion_tokens
+                ),
+                total_cached_tokens=(
+                    total_cached_tokens
+                ),
+                total_cost_usd=(
+                    total_cost_usd
+                    if cost_available
+                    else None
+                ),
+                total_steps=len(steps),
+                extra={
+                    "llm_call_count":
+                        llm_call_count,
+                    "tool_call_count":
+                        tool_call_count,
+                    "tool_error_count":
+                        tool_error_count,
+                    "total_llm_latency_sec":
+                        total_llm_latency_sec,
+                    "token_usage_available":
+                        token_usage_available,
+                },
+            ),
+            extra={
+                "source_format":
+                    "flagscale-kernel-callback-events-v2",
+                "native_event_count":
+                    len(events),
+                "native_events_file":
+                    events_path.name,
+                "trajectory_is_exact":
+                    not missing_tool_results,
+                "missing_tool_result_ids":
+                    missing_tool_results,
+                "tool_identity_link":
+                    "ToolCall.tool_call_id="
+                    "ObservationResult.source_call_id",
+                "token_usage_available":
+                    token_usage_available,
+            },
+        )
+
+        payload = trajectory.to_json_dict()
+
+        validator = TrajectoryValidator()
+        valid = validator.validate(payload)
+
+        if not valid:
+            errors = [
+                str(error)
+                for error in validator.get_errors()
+            ]
+            (
+                logs_dir
+                / "atif-validation-errors.json"
+            ).write_text(
+                json.dumps(
+                    {
+                        "valid": False,
+                        "errors": errors,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return None
+
+        temporary_path = trajectory_path.with_suffix(
+            ".json.tmp"
+        )
+        temporary_path.write_text(
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(trajectory_path)
+
+        (
+            logs_dir
+            / "atif-validation.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "valid": True,
+                    "schema_version": "ATIF-v1.7",
+                    "native_trace_schema":
+                        "kernel-callback-v2",
+                    "steps": len(steps),
+                    "llm_calls": llm_call_count,
+                    "tool_calls": tool_call_count,
+                    "missing_tool_results":
+                        missing_tool_results,
+                    "token_usage_available":
+                        token_usage_available,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        return trajectory_path
+
+
+    def _convert_native_events_to_atif(self,) -> Path | None:
+        """将FlagScale原生JSONL转换为ATIF-v1.7。"""
+
+        logs_dir = Path(self.logs_dir)
+        events_path = self._find_log_file(
+            "flagscale-events.jsonl"
+        )
+        trajectory_path = (
+            logs_dir / "trajectory.json"
+        )
+
+        if events_path is None:
+            return None
+
+        events: list[dict[str, Any]] = []
+
+        for line_number, raw_line in enumerate(
+            events_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines(),
+            start=1,
+        ):
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Invalid native event JSON at "
+                    f"line {line_number}: {exc}"
+                ) from exc
+
+            if isinstance(event, dict):
+                events.append(event)
+
+        if not events:
+            return None
+
+        # sequence_id优先；旧事件没有sequence_id时按时间排序。
+        def event_sort_key(
+            event: dict[str, Any],
+        ) -> tuple:
+            sequence_id = event.get("sequence_id")
+
+            if isinstance(sequence_id, int):
+                return (0, sequence_id)
+
+            return (
+                1,
+                str(event.get("timestamp", "")),
+                str(event.get("event_id", "")),
+            )
+
+        events.sort(key=event_sort_key)
+
+        # New Agent architecture records structured Kernel callback events.
+        # Prefer the new converter whenever assistant_response is present.
+        if any(
+            event.get("event_type") == "assistant_response"
+            for event in events
+        ):
+            return self._convert_kernel_callback_events_to_atif(
+                events=events,
+                events_path=events_path,
+                trajectory_path=trajectory_path,
+                logs_dir=logs_dir,
+            )
+
+        # Otherwise keep the legacy llm_request/llm_response conversion path
+        # for backward compatibility with older FlagScale-Agent runs.
+        request_by_call_id: dict[str, dict[str, Any]] = {}
+        tool_call_by_id: dict[str, dict[str, Any]] = {}
+        tool_result_by_id: dict[str, dict[str, Any]] = {}
+        tool_message_by_id: dict[str, dict[str, Any]] = {}
+
+        for event in events:
+            event_type = event.get("event_type")
+
+            if event_type == "llm_request":
+                call_id = str(event.get("call_id") or "")
+
+                if call_id:
+                    request_by_call_id[call_id] = event
+
+            elif event_type == "tool_call":
+                tool_call_id = str(
+                    event.get("tool_call_id") or ""
+                )
+
+                if tool_call_id:
+                    tool_call_by_id[tool_call_id] = event
+
+            elif event_type == "tool_result":
+                tool_call_id = str(
+                    event.get("source_call_id")
+                    or event.get("tool_call_id")
+                    or ""
+                )
+
+                if tool_call_id:
+                    tool_result_by_id[tool_call_id] = event
+
+            elif event_type == "tool_result_message":
+                tool_call_id = str(
+                    event.get("tool_call_id") or ""
+                )
+
+                if tool_call_id:
+                    tool_message_by_id[tool_call_id] = event
+
+        first_request = next(
+            (
+                event
+                for event in events
+                if event.get("event_type")
+                == "llm_request"
+            ),
+            None,
+        )
+
+        steps: list[Step] = []
+        next_step_id = 1
+
+        requested_model: str | None = None
+        tool_definitions: list[dict[str, Any]] = []
+
+        # 从第一次真实请求恢复system和初始user输入。
+        if first_request is not None:
+            request_payload = (
+                first_request.get("request") or {}
+            )
+
+            requested_model = (
+                first_request.get("model")
+            )
+
+            system_prompt = request_payload.get(
+                "system"
+            )
+
+            if system_prompt:
+                steps.append(
+                    Step(
+                        step_id=next_step_id,
+                        timestamp=first_request.get(
+                            "timestamp"
+                        ),
+                        source="system",
+                        message=self._json_text(
+                            system_prompt
+                        ),
+                    )
+                )
+                next_step_id += 1
+
+            for message in (
+                request_payload.get("messages") or []
+            ):
+                if not isinstance(message, dict):
+                    continue
+
+                if message.get("role") != "user":
+                    continue
+
+                user_text = self._extract_text(
+                    message.get("content")
+                )
+
+                if user_text:
+                    steps.append(
+                        Step(
+                            step_id=next_step_id,
+                            timestamp=first_request.get(
+                                "timestamp"
+                            ),
+                            source="user",
+                            message=user_text,
+                        )
+                    )
+                    next_step_id += 1
+
+                # 初始任务只记录一次。
+                break
+
+            # Anthropic工具Schema转成ATIF要求的函数Schema。
+            for tool in (
+                request_payload.get("tools") or []
+            ):
+                if not isinstance(tool, dict):
+                    continue
+
+                tool_definitions.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": str(
+                                tool.get(
+                                    "name",
+                                    "unknown",
+                                )
+                            ),
+                            "description": str(
+                                tool.get(
+                                    "description",
+                                    "",
+                                )
+                            ),
+                            "parameters": (
+                                tool.get(
+                                    "input_schema"
+                                )
+                                or {}
+                            ),
+                        },
+                    }
+                )
+
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_cached_tokens = 0
+        total_cost_usd = 0.0
+        cost_available = False
+        total_llm_latency_sec = 0.0
+
+        llm_call_count = 0
+        tool_call_count = 0
+        tool_error_count = 0
+        missing_tool_results: list[str] = []
+        resolved_models: list[str] = []
+
+        for event in events:
+            if event.get("event_type") != "llm_response":
+                continue
+
+            llm_call_count += 1
+
+            response = event.get("response") or {}
+            response_content = (
+                response.get("content") or []
+                if isinstance(response, dict)
+                else []
+            )
+
+            text_parts: list[str] = []
+            atif_tool_calls: list[ToolCall] = []
+            observation_results: list[
+                ObservationResult
+            ] = []
+
+            for block in response_content:
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    text = block.get("text")
+
+                    if isinstance(text, str) and text:
+                        text_parts.append(text)
+
+                    continue
+
+                if block_type != "tool_use":
+                    continue
+
+                tool_call_id = str(
+                    block.get("id") or ""
+                )
+                tool_name = str(
+                    block.get("name") or "unknown"
+                )
+                arguments = (
+                    block.get("input") or {}
+                )
+
+                tool_call_count += 1
+
+                executor_event = tool_call_by_id.get(
+                    tool_call_id
+                )
+
+                tool_extra = self._clean_extra(
+                    {
+                        "execution_mode": (
+                            executor_event or {}
+                        ).get("execution_mode"),
+                        "intended_execution": (
+                            executor_event or {}
+                        ).get(
+                            "intended_execution"
+                        ),
+                        "turn_count": (
+                            executor_event or {}
+                        ).get("turn_count"),
+                    }
+                )
+
+                atif_tool_calls.append(
+                    ToolCall(
+                        tool_call_id=tool_call_id,
+                        function_name=tool_name,
+                        arguments=arguments,
+                        extra=tool_extra or None,
+                    )
+                )
+
+                result_event = (
+                    tool_result_by_id.get(
+                        tool_call_id
+                    )
+                    or tool_message_by_id.get(
+                        tool_call_id
+                    )
+                )
+
+                if result_event is None:
+                    missing_tool_results.append(
+                        tool_call_id
+                    )
+                    continue
+
+                status = str(
+                    result_event.get(
+                        "status",
+                        "unknown",
+                    )
+                ).lower()
+
+                is_error = bool(
+                    result_event.get("is_error")
+                ) or status in {
+                    "error",
+                    "failed",
+                    "failure",
+                }
+
+                if is_error:
+                    tool_error_count += 1
+
+                result_value = result_event.get(
+                    "result"
+                )
+
+                if result_value is None:
+                    result_value = result_event.get(
+                        "content"
+                    )
+
+                if result_value is None:
+                    result_value = result_event.get(
+                        "error_message"
+                    )
+
+                observation_extra = (
+                    self._clean_extra(
+                        {
+                            "status": status,
+                            "is_error": is_error,
+                            "executed": (
+                                result_event.get(
+                                    "executed"
+                                )
+                            ),
+                            "duration_sec": (
+                                result_event.get(
+                                    "duration_sec"
+                                )
+                            ),
+                            "skip_reason": (
+                                result_event.get(
+                                    "skip_reason"
+                                )
+                            ),
+                            "error_type": (
+                                result_event.get(
+                                    "error_type"
+                                )
+                            ),
+                            "error_message": (
+                                result_event.get(
+                                    "error_message"
+                                )
+                            ),
+                            "execution_mode": (
+                                result_event.get(
+                                    "execution_mode"
+                                )
+                            ),
+                            "result_timestamp": (
+                                result_event.get(
+                                    "timestamp"
+                                )
+                            ),
+                        }
+                    )
+                )
+
+                observation_results.append(
+                    ObservationResult(
+                        source_call_id=tool_call_id,
+                        content=self._json_text(
+                            result_value
+                        ),
+                        extra=(
+                            observation_extra or None
+                        ),
+                    )
+                )
+
+            usage = event.get("usage") or {}
+
+            uncached_input = self._safe_int(
+                usage.get("input_tokens")
+            )
+            cache_creation = self._safe_int(
+                usage.get(
+                    "cache_creation_input_tokens"
+                )
+            )
+            cache_read = self._safe_int(
+                usage.get(
+                    "cache_read_input_tokens"
+                )
+            )
+            output_tokens = self._safe_int(
+                usage.get("output_tokens")
+            )
+
+            # ATIF的prompt_tokens要求包含缓存和非缓存输入。
+            prompt_tokens = (
+                uncached_input
+                + cache_creation
+                + cache_read
+            )
+
+            total_prompt_tokens += prompt_tokens
+            total_completion_tokens += (
+                output_tokens
+            )
+            total_cached_tokens += cache_read
+
+            cost_usd = usage.get("cost_usd")
+
+            if cost_usd is not None:
+                total_cost_usd += float(cost_usd)
+                cost_available = True
+
+            latency_sec = event.get(
+                "latency_sec"
+            )
+
+            if isinstance(latency_sec, (int, float)):
+                total_llm_latency_sec += float(
+                    latency_sec
+                )
+
+            call_id = str(
+                event.get("call_id") or ""
+            )
+            request_event = request_by_call_id.get(
+                call_id
+            ) or {}
+
+            actual_model = (
+                event.get("model")
+                or (
+                    response.get("model")
+                    if isinstance(response, dict)
+                    else None
+                )
+                or request_event.get("model")
+            )
+
+            if actual_model:
+                model_text = str(actual_model)
+
+                if model_text not in resolved_models:
+                    resolved_models.append(
+                        model_text
+                    )
+
+            step_extra = self._clean_extra(
+                {
+                    "llm_call_id": call_id,
+                    "provider": event.get(
+                        "provider"
+                    ),
+                    "requested_model": (
+                        request_event.get("model")
+                    ),
+                    "resolved_model": actual_model,
+                    "streaming": event.get(
+                        "streaming"
+                    ),
+                    "stop_reason": (
+                        event.get("stop_reason")
+                        or (
+                            response.get(
+                                "stop_reason"
+                            )
+                            if isinstance(
+                                response,
+                                dict,
+                            )
+                            else None
+                        )
+                    ),
+                    "latency_sec": latency_sec,
+                    "uncached_input_tokens": (
+                        uncached_input
+                    ),
+                    "cache_creation_input_tokens": (
+                        cache_creation
+                    ),
+                }
+            )
+
+            steps.append(
+                Step(
+                    step_id=next_step_id,
+                    timestamp=event.get(
+                        "timestamp"
+                    ),
+                    source="agent",
+                    model_name=(
+                        str(actual_model)
+                        if actual_model
+                        else None
+                    ),
+                    # ATIF-v1.7中message是必填字段。
+                    message="\n\n".join(
+                        text_parts
+                    ),
+                    tool_calls=(
+                        atif_tool_calls or None
+                    ),
+                    observation=(
+                        Observation(
+                            results=observation_results
+                        )
+                        if observation_results
+                        else None
+                    ),
+                    metrics=Metrics(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=(
+                            output_tokens
+                        ),
+                        cached_tokens=cache_read,
+                        cost_usd=(
+                            float(cost_usd)
+                            if cost_usd is not None
+                            else None
+                        ),
+                        extra={
+                            "cache_creation_input_tokens":
+                                cache_creation,
+                            "uncached_input_tokens":
+                                uncached_input,
+                        },
+                    ),
+                    llm_call_count=1,
+                    extra=step_extra or None,
+                )
+            )
+
+            next_step_id += 1
+
+        if not steps:
+            return None
+
+        session_id = next(
+            (
+                str(event["session_id"])
+                for event in events
+                if event.get("session_id")
+            ),
+            None,
+        )
+
+        agent_model = (
+            resolved_models[0]
+            if resolved_models
+            else requested_model
+        )
+
+        trajectory = Trajectory(
+            schema_version="ATIF-v1.7",
+            session_id=session_id,
+            agent=Agent(
+                name=self.name(),
+                version=(
+                    self.version() or "unknown"
+                ),
+                model_name=agent_model,
+                tool_definitions=(
+                    tool_definitions or None
+                ),
+                extra={
+                    "requested_model":
+                        requested_model,
+                    "resolved_models":
+                        resolved_models,
+                },
+            ),
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=(
+                    total_prompt_tokens
+                ),
+                total_completion_tokens=(
+                    total_completion_tokens
+                ),
+                total_cached_tokens=(
+                    total_cached_tokens
+                ),
+                total_cost_usd=(
+                    total_cost_usd
+                    if cost_available
+                    else None
+                ),
+                total_steps=len(steps),
+                extra={
+                    "llm_call_count":
+                        llm_call_count,
+                    "tool_call_count":
+                        tool_call_count,
+                    "tool_error_count":
+                        tool_error_count,
+                    "total_llm_latency_sec":
+                        total_llm_latency_sec,
+                },
+            ),
+            extra={
+                "source_format":
+                    "flagscale-native-events-v1",
+                "native_event_count":
+                    len(events),
+                "native_events_file":
+                    events_path.name,
+                "trajectory_is_exact":
+                    not missing_tool_results,
+                "missing_tool_result_ids":
+                    missing_tool_results,
+            },
+        )
+
+        payload = trajectory.to_json_dict()
+
+        validator = TrajectoryValidator()
+        valid = validator.validate(payload)
+
+        if not valid:
+            errors = [
+                str(error)
+                for error in validator.get_errors()
+            ]
+
+            (
+                logs_dir
+                / "atif-validation-errors.json"
+            ).write_text(
+                json.dumps(
+                    {
+                        "valid": False,
+                        "errors": errors,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            return None
+
+        temporary_path = trajectory_path.with_suffix(
+            ".json.tmp"
+        )
+
+        temporary_path.write_text(
+            json.dumps(
+                payload,
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        temporary_path.replace(
+            trajectory_path
+        )
+
+        (
+            logs_dir
+            / "atif-validation.json"
+        ).write_text(
+            json.dumps(
+                {
+                    "valid": True,
+                    "schema_version":
+                        "ATIF-v1.7",
+                    "steps": len(steps),
+                    "llm_calls":
+                        llm_call_count,
+                    "tool_calls":
+                        tool_call_count,
+                    "missing_tool_results":
+                        missing_tool_results,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        return trajectory_path
+
+
+    def _validate_atif(self, path: Path) -> tuple[bool, list[str]]:
+     """校验trajectory.json是否符合ATIF。"""
+     if not path.is_file():
+            return False, [f"Trajectory file not found: {path}"]
+
+     validator = TrajectoryValidator()
+     valid = validator.validate(str(path))
+
+     errors = []
+
+     if not valid:
+        errors = [
+            str(error)
+            for error in validator.get_errors()
+        ]
+
+     return valid, errors
+
+    def _prepare_atif_trajectory(self,) -> None:
+        """生成、校验并保存ATIF轨迹。"""
+
+        logs_dir = Path(self.logs_dir)
+        logs_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        trajectory_path = (
+            logs_dir / "trajectory.json"
+        )
+
+        events_path = self._find_log_file(
+            "flagscale-events.jsonl"
+        )
+
+        # 防止run()与populate_context_post_run()重复生成
+        if (
+            trajectory_path.is_file()
+            and trajectory_path.stat().st_size > 0
+        ):
+            return
+
+        try:
+            if events_path is None:
+                print(
+                    "WARNING: FlagScale native event "
+                    "file does not exist",
+                    flush=True,
+                )
+                return
+
+            path = (
+                self._convert_native_events_to_atif()
+            )
+
+            if path is None:
+                print(
+                    "WARNING: ATIF trajectory "
+                    "was not generated",
+                    flush=True,
+                )
+                return
+
+            valid, errors = self._validate_atif(
+                path
+            )
+
+            if not valid:
+                error_path = (
+                    logs_dir
+                    / "atif-validation-errors.json"
+                )
+
+                error_path.write_text(
+                    json.dumps(
+                        {
+                            "valid": False,
+                            "errors": errors,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                print(
+                    f"WARNING: Invalid ATIF "
+                    f"trajectory: {path}",
+                    flush=True,
+                )
+                return
+
+            print(
+                f"ATIF trajectory generated: {path}",
+                flush=True,
+            )
+
+        except Exception as exc:
+            error_path = (
+                logs_dir
+                / "atif-generation-error.txt"
+            )
+
+            error_path.write_text(
+                f"{type(exc).__name__}: {exc}\n",
+                encoding="utf-8",
+            )
+
+            print(
+                "WARNING: ATIF generation failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    def _finalize_once(self,context: AgentContext,) -> None:
+        """幂等生成ATIF并填充Harbor AgentContext。"""
+
+        logs_key = str(
+            Path(self.logs_dir).resolve()
+        )
+
+        if (
+            getattr(
+                self,
+                "_finalized_logs_dir",
+                None,
+            )
+            == logs_key
+        ):
+            return
+
+        self._prepare_atif_trajectory()
+        self._populate_context_from_logs(
+            context
+        )
+
+        self._finalized_logs_dir = logs_key
+        
+    def populate_context_post_run(
+        self,
+        context: AgentContext,
+    ) -> None:
+        """先生成trajectory.json,再由_collect_usage()读取trajectory.json
+            最后将Token等写入AgentContext"""
+        self._finalize_once(context)
